@@ -1,0 +1,25 @@
+RLT Training Package Manifest
+Generated: 2026-06-23
+Source: /home/host5010/workspaces/smq&jgy/rlt_project
+
+Included:
+  - rlt_reproduce/          Full RLT reproduction source
+  - configs/default.yaml    Hyperparameters
+  - scripts/setup_env.sh    Conda environment setup
+  - scripts/setup_gpu.sh    CUDA PyTorch install
+  - src/rlt/                RL token, TD3 learner, VLA wrapper, mock env
+  - third_party/openpi/     openpi source (without .git)
+
+Excluded (rebuild on GPU host):
+  - .git/
+  - .venv/
+  - __pycache__/
+  - checkpoints/, logs/, outputs/ (if present)
+
+Entry points:
+  python -m rlt.scripts.verify_env
+  python -m rlt.scripts.smoke_test
+  python -m rlt.scripts.train_rl_token
+  python -m rlt.scripts.train_online_rl
+
+See RLT训练包部署指南.md for full deployment instructions.

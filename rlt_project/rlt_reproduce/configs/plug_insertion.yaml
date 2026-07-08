@@ -1,0 +1,48 @@
+# Plug insertion task (RLT paper: Plug in Charger)
+# Collect on robot PC; train VLA / RL Token on GPU host.
+
+robot:
+  backend: deoxys
+  deoxys_config: /home/host5010/workspaces/wty/deoxys_control/deoxys/config/charmander.yml
+  deoxys_root: /home/host5010/workspaces/wty/deoxys_control/deoxys
+  control_hz: 20
+  action_scale: [0.05, 0.02, 1.0]
+  proprio_dim: 8
+
+gripper:
+  type: franka
+  config: configs/franka/franka_hand.yaml
+
+cameras:
+  # RealSense serials — run: python deoxys/examples/test_camera.py
+  mapping:
+    wrist: "215222079599"
+    external: "335622072595"
+  width: 640
+  height: 480
+  image_size: [224, 224]
+
+vla:
+  checkpoint: null
+  config_name: pi05_base
+  action_dim: 7
+  vla_chunk_horizon: 50
+  execute_prefix: 20
+  language_instruction: "plug the charger into the power socket"
+
+data_collection:
+  fps: 20
+  phase: critical
+  controller_type: OSC_POSE
+  controller_cfg: osc-position-controller.yml
+
+paths:
+  data_dir: data
+  checkpoint_dir: checkpoints
+  log_dir: logs
+  output_dir: outputs
+  episodes_dir: data/episodes/plug_insertion
+  embeddings_dir: data/embeddings/plug_insertion
+  export_dir: data/export_for_gpu
+
+device: cpu

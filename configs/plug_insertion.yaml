@@ -1,0 +1,104 @@
+# Plug insertion — robot PC overrides (GPU train yaml is source of truth for inference/RL).
+# Online RL actor reads this file; GPU rl_server uses deploy-tree yaml (inference.mode there).
+
+robot:
+  backend: deoxys
+  deoxys_root: third_party/deoxys
+  deoxys_config: config/charmander.yml
+  control_hz: 20
+  action_scale: [0.05, 0.02, 1.0]
+  proprio_dim: 8
+  language: "plug the charger into the power socket"
+
+gripper:
+  type: franka
+  config: configs/franka/franka_hand.yaml
+
+cameras:
+  backend: deoxys_realsense
+  mapping:
+    wrist: "215222079599"
+    external: "254322072381"
+  width: 640
+  height: 480
+  fps: 30
+  image_size: [224, 224]
+
+vla:
+  action_dim: 7
+  vla_chunk_horizon: 15
+  execute_prefix: 10
+  language_instruction: "plug the charger into the power socket"
+
+online_rl:
+  chunk_length: 10
+  action_dim: 7
+  control_hz: 20
+  max_steps_per_episode: 200
+  max_episodes: 50
+  reset_mode: demo_fast
+  post_reset_wait_sec: 0.2
+
+gpu_server:
+  mock: false
+  host: "10.176.53.120"
+  port: 8765
+
+data_collection:
+  fps: 20
+  phase: critical
+  controller_type: OSC_POSE
+  controller_cfg: configs/deoxys/osc-pose-controller.yml
+  gripper_latch: true
+  spacemouse_vendor_id: 9583
+  spacemouse_product_id: 50746
+  reset_joint_positions:
+    - 0.05904578
+    - 0.52446592
+    - -0.15976057
+    - -0.76166065
+    - 0.18787272
+    - 1.7980539
+    - 0.81746185
+  use_demo_reset: true
+  # Resolved via paths.demo_reset_path (SMQ root relative); legacy fallback data/plug_insertion
+  demo_reset_path: rlt_project/rlt_reproduce/data/plug_insertion
+  demo_reset_pos_tol_m: 0.06
+  demo_reset_rot_tol_deg: 5.0
+  demo_reset_trim_orientation: false
+  demo_reset_require_home_first: false
+  # home_mode: hover = OSC to hover above target demo (z~0.25), NOT joint home (z~0.61 teleop pose)
+  demo_reset_home_mode: hover
+  demo_reset_pin_episode: ep_00022
+  demo_reset_approach_clearance_m: 0.05
+  demo_reset_min_hover_z_m: 0.20
+  demo_reset_position_tol_m: 0.05
+  demo_reset_position_max_rounds: 10
+  demo_reset_position_min_steps: 40
+  demo_reset_position_max_steps: 350
+  demo_reset_direct_move_under_m: 0.12
+  demo_reset_max_pos_delta_m: 0.50
+  demo_reset_min_target_z_m: 0.12
+  demo_reset_max_target_z_m: 0.80
+  demo_reset_joint_timeout: 12.0
+  demo_reset_post_home_wait_sec: 0.2
+  demo_reset_gripper_hold_closed: true
+  # demo_fast: skip reset motion if already within 6cm of pinned demo
+  demo_reset_skip_if_within_m: 0.06
+  demo_reset_home_fallback_delta_m: 0.50
+  # Optional: lower joint home only when home_mode=joint (teleop reset_joint_positions stays high)
+  # demo_reset_home_joints: [j1, j2, j3, j4, j5, j6, j7]
+  joint_controller_cfg: joint-position-controller.yml
+
+paths:
+  data_dir: data
+  checkpoint_dir: checkpoints
+  log_dir: logs
+  output_dir: outputs
+  episodes_dir: data/episodes/plug_insertion
+  sft_episodes_dir: data/sft/plug_insertion
+  embeddings_dir: data/embeddings/plug_insertion
+  export_dir: data/export_for_gpu
+  demo_reset_path: rlt_project/rlt_reproduce/data/plug_insertion
+
+device: cpu
