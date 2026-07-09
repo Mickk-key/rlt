@@ -1,0 +1,86 @@
+# RLT real-robot config: FR3 (deoxys) + Franka Hand
+
+robot:
+  backend: deoxys
+  deoxys_config: /home/host5010/workspaces/wty/deoxys_control/deoxys/config/charmander.yml
+  deoxys_root: /home/host5010/workspaces/wty/deoxys_control/deoxys
+  control_hz: 20
+  action_scale: [0.05, 0.02, 1.0]
+  proprio_dim: 8
+
+gripper:
+  type: franka
+  config: configs/franka/franka_hand.yaml
+
+cameras:
+  wrist_camera_id: 0
+  external_camera_id: 2
+  image_size: [224, 224]
+
+vla:
+  checkpoint: null
+  config_name: pi05_base
+  action_dim: 7
+  vla_chunk_horizon: 50
+  execute_prefix: 20
+  language_instruction: "complete the precision insertion"
+
+rl_token:
+  embed_dim: 2048
+  token_dim: 2048
+  num_encoder_layers: 2
+  num_decoder_layers: 2
+  num_heads: 8
+  ff_dim: 4096
+  dropout: 0.0
+  train_steps: 5000
+  batch_size: 32
+  lr: 1.0e-4
+
+online_rl:
+  chunk_length: 10
+  action_dim: 7
+  control_hz: 20
+  discount: 0.99
+  warmup_steps: 500
+  update_to_data_ratio: 5
+  critic_updates_per_actor: 2
+  batch_size: 256
+  replay_capacity: 100000
+  actor_lr: 3.0e-4
+  critic_lr: 3.0e-4
+  policy_constraint_beta: 1.0
+  reference_dropout: 0.5
+  action_noise_std: 0.05
+  actor_hidden: [256, 256]
+  critic_hidden: [256, 256]
+  critic_ensemble: 2
+  target_update_tau: 0.005
+  max_episodes: 100
+  # Online RL checkpointing (GPU rl_server)
+  checkpoint_save_interval_updates: 50
+  checkpoint_keep_last: 5
+  checkpoint_save_on_shutdown: true
+
+inference:
+  mode: reference
+  reference_noise_std: 0.05
+
+data_collection:
+  fps: 20
+  phase: critical
+  controller_type: OSC_POSE
+  controller_cfg: osc-position-controller.yml
+  save_images: true
+  save_on_key: s
+  fail_on_key: f
+
+paths:
+  data_dir: data
+  checkpoint_dir: checkpoints
+  log_dir: logs
+  output_dir: outputs
+  episodes_dir: data/episodes
+  embeddings_dir: data/embeddings
+
+device: cpu

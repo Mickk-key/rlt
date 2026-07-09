@@ -1,0 +1,6 @@
+# Franka Hand (native via deoxys gripper-interface + FCI port 1338)
+
+gripper_type: franka
+max_width: 0.08
+binary_open_threshold: 0.5
+binary_close_threshold: -0.5
