@@ -11,10 +11,10 @@ from pathlib import Path
 import yaml
 from rich.console import Console
 
-from rlt.hardware.deoxys.fast_reset import FastResetConfig, InitCubeConfig, reset_to_collection_init
+from rlt.hardware.deoxys.collection_reset import reset_to_init_cube
+from rlt.hardware.deoxys.fast_reset import InitCubeConfig
 from rlt.hardware.gripper_factory import create_gripper, uses_deoxys_gripper
 from rlt.util.deoxys_paths import resolve_controller_cfg_path, smq_root_from_rlt
-from rlt.teleop.spacemouse_control import DEFAULT_RESET_JOINTS
 
 console = Console()
 
@@ -46,7 +46,7 @@ def main() -> None:
     sc = raw.get("sft_collection", {})
     dc = raw.get("data_collection", {})
     ws_raw = sc.get("workspace_randomization", {})
-    cube_cfg = InitCubeConfig.from_yaml_dict(ws_raw)
+    InitCubeConfig.from_yaml_dict(ws_raw)  # validate
 
     deoxys_root = robot_cfg["deoxys_root"]
     interface_cfg = args.interface_cfg or robot_cfg["deoxys_config"]
@@ -88,27 +88,17 @@ def main() -> None:
         )
     ).as_easydict()
 
-    home_joints = list(sc.get("reset_joint_positions", dc.get("reset_joint_positions")) or DEFAULT_RESET_JOINTS)
-    fast_cfg = FastResetConfig(
-        control_hz=fps,
-        pos_tol_m=float(sc.get("reset_pos_tol_m", 0.015)),
-        home_joints=home_joints,
-        joint_home_if_delta_above_m=float(sc.get("joint_home_if_delta_above_m", 0.35)),
-        approach_xy_first=bool(sc.get("approach_xy_first", True)),
-    )
-
     randomize = not args.fixed
     if args.random:
         randomize = True
 
     try:
-        result = reset_to_collection_init(
+        result = reset_to_init_cube(
             robot,
             gripper=gripper,
-            cube_cfg=cube_cfg,
             osc_position_cfg=osc_cfg,
             joint_controller_cfg=joint_cfg,
-            reset_cfg=fast_cfg,
+            raw=raw,
             randomize=randomize,
             logger=console,
         )

@@ -1,11 +1,14 @@
 # GPU 端启动 smq&jgy JPEG WebSocket Server
 
+> 最后更新：**2026-07-10**  
 > **工控机连的是 `10.176.53.120:8765`**（工控机 `10.162.132.11` 能 ping 通）。  
 > **fvl08（192.168.110.18）与工控机不在同一可达网段**，在 fvl08 上起 server 工控机连不上。
 
 ---
 
 ## 1. 从工控机同步代码（在工控机执行）
+
+工控机改完 `rl_server.py` / `gpu_client.py` 后需重新打包同步 GPU，否则 GPU 仍可能是旧版（例如每步两次 VLA、无 checkpoint 保存）。
 
 ```bash
 cd "/home/host5010/workspaces/smq&jgy"
@@ -54,6 +57,12 @@ DEVICE=cpu bash scripts/run_rl_server.sh configs/plug_insertion.yaml
 **正确栈**：`run_rl_server.sh` → `python -m rlt.scripts.rl_server` → JSON + `images_jpeg` base64。
 
 **错误栈**：rlt_reproduce 独立仓里旧的 msgpack `{type: act|transition}` handler。
+
+**2026-07-10 工控机侧已改、需同步到 GPU 的行为：**
+
+- 每次 `infer` **只跑一次 VLA**（encode + reference 合并）
+- `warmup_steps` 满后 learner 更新；周期写入 `checkpoints/online_rl/`（`rl_actor.pt`、`rl_critic.pt`）
+- 工控机 `gpu_client` 默认 `infer_timeout_sec: 180`（首帧 CUDA warmup 较慢）
 
 ---
 

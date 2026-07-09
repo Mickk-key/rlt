@@ -13,7 +13,7 @@ from typing import Any
 
 import numpy as np
 
-from rlt.rl.ws_protocol import pack_observation
+from rlt.rl.ws_protocol import ensure_observation_images_jpeg
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +101,7 @@ class WebsocketRLClient(GPUClient):
         self._ws = None
         self._ready = threading.Event()
         self._lock = threading.Lock()
+        self._infer_debug_done = False
 
     def _ensure_thread(self) -> None:
         if self._thread is not None and self._thread.is_alive():
@@ -156,16 +157,46 @@ class WebsocketRLClient(GPUClient):
         proprio = observation.get("proprio")
         if proprio is None:
             raise ValueError("observation must include proprio")
-        images = observation.get("images")
-        msg = {
+
+        prepared = ensure_observation_images_jpeg(
+            observation,
+            image_size=self.image_size,
+        )
+        if not self._infer_debug_done:
+            self._infer_debug_done = True
+            images = prepared.get("images") or {}
+            jpegs = prepared.get("images_jpeg") or {}
+            proprio_arr = np.asarray(proprio, dtype=np.float32)
+            logger.info(
+                "first infer obs keys=%s images keys=%s images_jpeg keys=%s "
+                "jpeg lens external=%s wrist=%s proprio shape=%s",
+                sorted(prepared.keys()),
+                sorted(images.keys()),
+                sorted(jpegs.keys()),
+                len(jpegs.get("external", "")),
+                len(jpegs.get("wrist", "")),
+                proprio_arr.shape,
+            )
+
+        msg: dict[str, Any] = {
             "type": "infer",
-            **pack_observation(
-                np.asarray(proprio, dtype=np.float32),
-                images=images,
-                language=str(observation.get("language", "")),
-                image_size=self.image_size,
-            ),
+            "proprio": np.asarray(proprio, dtype=np.float32),
+            "language": str(prepared.get("language", "")),
         }
+        if prepared.get("images_jpeg"):
+            msg["images_jpeg"] = prepared["images_jpeg"]
+        elif prepared.get("images"):
+            raise RuntimeError(
+                "infer payload missing images_jpeg despite raw images present — "
+                f"keys={sorted(prepared['images'])}"
+            )
+        else:
+            raise RuntimeError(
+                "infer payload missing images_jpeg (external + wrist). "
+                "Robot actor did not receive RealSense RGB frames — check camera cache / "
+                "wait_for_rgb_frames in actor_loop."
+            )
+
         resp = self._request(msg)
         if resp.get("type") == "error":
             raise RuntimeError(resp.get("message", "infer failed"))
@@ -244,8 +275,9 @@ def create_gpu_client(
         return MockGPUClient(action_dim=action_dim, chunk_length=chunk_length)
 
     port = int(os.environ.get("GPU_SERVER_PORT", gpu.get("port", 8765)))
+    timeout_sec = float(os.environ.get("GPU_INFER_TIMEOUT_SEC", gpu.get("infer_timeout_sec", 180.0)))
     cam_cfg = raw.get("cameras", {})
     img_size_raw = cam_cfg.get("image_size")
     image_size = tuple(img_size_raw) if img_size_raw else None
-    logger.info("Connecting to GPU RL server ws://%s:%d", host, port)
-    return WebsocketRLClient(host=str(host), port=port, image_size=image_size)
+    logger.info("Connecting to GPU RL server ws://%s:%d (timeout=%.0fs)", host, port, timeout_sec)
+    return WebsocketRLClient(host=str(host), port=port, timeout_sec=timeout_sec, image_size=image_size)

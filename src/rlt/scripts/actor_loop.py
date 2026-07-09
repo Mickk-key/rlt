@@ -26,12 +26,19 @@ import numpy as np
 import yaml
 from rich.console import Console
 
-from rlt.hardware.deoxys.camera_source import build_deoxys_realsense_pair, read_rgb_frames
+from rlt.hardware.deoxys.collection_reset import collection_reset_settings, resolve_reset_yaml
+from rlt.hardware.deoxys.camera_source import (
+    build_deoxys_realsense_pair,
+    flush_rgb_frame_cache,
+    read_rgb_frames,
+    wait_for_fresh_rgb_frames,
+    wait_for_rgb_frames,
+)
 from rlt.hardware.deoxys.reset_manager import ResetManager
 from rlt.hardware.gripper_factory import create_robot_env
 from rlt.rl.gpu_client import GPUClient, MockGPUClient, create_gpu_client
 from rlt.rl.reward_logger import EpisodeOutcome, RewardLogger
-from rlt.rl.ws_protocol import pack_observation
+from rlt.rl.ws_protocol import ensure_observation_images_jpeg, pack_observation
 from rlt.sim.mock_env import MockPrecisionEnv
 from rlt.util.deoxys_paths import apply_deoxys_paths
 from rlt.util.terminal_keys import stdin_is_tty, terminal_keys
@@ -56,18 +63,102 @@ def _setup_cameras(raw: dict, robot_cfg: dict):
     return build_deoxys_realsense_pair(cam_cfg, deoxys_root=robot_cfg.get("deoxys_root"))
 
 
+def _verify_reset_pose(
+    env,
+    reset_info: dict,
+    *,
+    max_pos_err_m: float,
+) -> None:
+    """Fail fast if reset did not reach init-cube height before VLA infer."""
+    if not reset_info.get("workspace_reset") and not reset_info.get("external_reset"):
+        return
+    if reset_info.get("external_reset"):
+        z = float(reset_info.get("ee_z_m", env.get_proprio()[2]))
+        if z < 0.19:
+            raise RuntimeError(
+                f"External reset EE z={z:.4f}m too low (<0.19m) — aborting before VLA infer"
+            )
+        return
+
+    err = float(reset_info.get("pos_err_m", 0.0))
+    if err > max_pos_err_m:
+        raise RuntimeError(
+            f"Reset position error {err*100:.2f}cm exceeds limit {max_pos_err_m*100:.2f}cm — "
+            "aborting episode before VLA infer"
+        )
+    if hasattr(env, "get_proprio") and reset_info.get("target_xyz"):
+        proprio = env.get_proprio()
+        target = np.asarray(reset_info["target_xyz"], dtype=np.float64)
+        actual = proprio[:3].astype(np.float64)
+        live_err = float(np.linalg.norm(actual - target))
+        if live_err > max_pos_err_m:
+            raise RuntimeError(
+                f"Live EE error {live_err*100:.2f}cm vs target {target.round(4).tolist()} "
+                f"(reset reported {err*100:.2f}cm) — wait longer or re-reset"
+            )
+
+
+def _post_reset_warmup(
+    env,
+    *,
+    steps: int,
+    control_hz: float,
+    camera_manager,
+    camera_mapping: dict[str, str],
+    frame_cache: dict[str, np.ndarray] | None,
+) -> None:
+    """Hold at reset pose while cameras catch up (mirrors SFT post_reset_warmup_steps)."""
+    if steps <= 0:
+        return
+    dt = 1.0 / control_hz
+    for i in range(steps):
+        if camera_manager is not None and camera_mapping:
+            read_rgb_frames(camera_manager, camera_mapping, cache=frame_cache)
+        if hasattr(env, "get_proprio"):
+            env.get_proprio()
+        if i == 0 or i == steps - 1:
+            if hasattr(env, "get_proprio"):
+                z = float(env.get_proprio()[2])
+                console.print(f"[dim]post-reset warmup[/dim] {i + 1}/{steps} ee_z={z:.4f}m")
+        time.sleep(dt)
+
+
 def _build_observation(
     proprio: np.ndarray,
     camera_manager,
     camera_mapping: dict[str, str],
     language: str,
+    *,
+    frame_cache: dict[str, np.ndarray] | None = None,
+    wait_timeout_sec: float = 3.0,
 ) -> dict[str, Any]:
     obs: dict[str, Any] = {
         "proprio": proprio.astype(np.float32),
         "language": language,
     }
-    images = read_rgb_frames(camera_manager, camera_mapping)
-    if images:
+    if camera_manager is None or not camera_mapping:
+        return obs
+
+    cache = frame_cache if frame_cache is not None else {}
+    read_rgb_frames(camera_manager, camera_mapping, cache=cache, allow_stale=True)
+    missing = [name for name in camera_mapping if name not in cache]
+    if missing:
+        try:
+            wait_for_rgb_frames(
+                camera_manager,
+                camera_mapping,
+                cache=cache,
+                timeout_sec=wait_timeout_sec,
+            )
+        except TimeoutError as exc:
+            raise RuntimeError(
+                f"RealSense frames unavailable for {missing}. "
+                "deoxys get_all_latest_frames() only returns new frames since last read — "
+                "check cameras with: bash scripts/verify_camera_roles.sh"
+            ) from exc
+
+    images = {name: cache[name] for name in camera_mapping if name in cache}
+    if len(images) == len(camera_mapping):
         obs["images"] = images
     return obs
 
@@ -95,6 +186,8 @@ def run_episode(
     camera_mapping: dict[str, str],
     log_dir: Path | None,
     episode_index: int,
+    image_size: tuple[int, int] | None = None,
+    frame_cache: dict[str, np.ndarray] | None = None,
 ) -> EpisodeOutcome:
     """One critical-phase episode: infer chunks, execute, poll reward until done."""
     dt = 1.0 / control_hz
@@ -105,26 +198,62 @@ def run_episode(
     episode_id = f"ep_{episode_index:04d}"
 
     while True:
-        obs = _build_observation(proprio, camera_manager, camera_mapping, language)
+        obs = _build_observation(
+            proprio,
+            camera_manager,
+            camera_mapping,
+            language,
+            frame_cache=frame_cache,
+        )
+        if step == 0:
+            preview = ensure_observation_images_jpeg(obs, image_size=image_size)
+            images = preview.get("images") or obs.get("images") or {}
+            jpegs = preview.get("images_jpeg") or {}
+            ee_z = float(proprio[2])
+            console.print(
+                f"[dim]first infer obs[/dim] keys={sorted(obs.keys())} "
+                f"images={sorted(images.keys())} "
+                f"images_jpeg={sorted(jpegs.keys())} "
+                f"jpeg_lens external={len(jpegs.get('external', ''))} "
+                f"wrist={len(jpegs.get('wrist', ''))} "
+                f"proprio_shape={np.asarray(proprio).shape} ee_z={ee_z:.4f}m"
+            )
+            if not jpegs:
+                raise RuntimeError(
+                    "first infer missing images_jpeg — RealSense returned no RGB frames "
+                    f"(cache keys={sorted((frame_cache or {}).keys())})"
+                )
+            console.print(
+                "[yellow]First GPU VLA infer may take 30–90s (CUDA warmup). Please wait…[/yellow]"
+            )
         result = gpu.infer(obs)
         if result.state is None:
             raise RuntimeError("GPU infer missing encoded state — restart GPU rl_server with latest code")
         current_state = np.asarray(result.state, dtype=np.float32)
         action_chunk = result.action_chunk
         ref_chunk = result.reference_action
+        policy_mode = (result.meta or {}).get("policy_mode", "reference")
+        exec_chunk = ref_chunk if policy_mode == "reference" else action_chunk
         if step == 0 and result.meta:
             console.print(f"[dim]GPU infer meta[/dim] {result.meta}")
             console.print(
-                f"[dim]first action[/dim] pos={action_chunk[0][:3].round(4).tolist()} "
-                f"gripper_raw={float(action_chunk[0][6]):.4f} (latched→1.0 if gripper_latch)"
+                f"[dim]first action ({policy_mode})[/dim] pos={exec_chunk[0][:3].round(4).tolist()} "
+                f"gripper_raw={float(exec_chunk[0][6]):.4f} (latched→1.0 if gripper_latch)"
             )
-        n_exec = min(chunk_length, execute_prefix, len(action_chunk))
+        n_exec = min(chunk_length, execute_prefix, len(exec_chunk))
 
         for i in range(n_exec):
-            action = action_chunk[i].astype(np.float32)
+            action = exec_chunk[i].astype(np.float32)
             ref_step = ref_chunk[i].astype(np.float32)
+            ee_before = proprio[:3].copy()
             next_proprio, _, _, _ = env.step(action)
             step += 1
+            if step <= 5:
+                delta_cm = (next_proprio[:3] - ee_before) * 100.0
+                console.print(
+                    f"[dim]step {step}[/dim] ee_delta_cm={delta_cm.round(2).tolist()} "
+                    f"action_pos_m={action[:3].round(5).tolist()}"
+                )
 
             outcome = reward_logger.poll(step)
             step_reward = float(outcome.reward) if outcome else 0.0
@@ -141,7 +270,13 @@ def run_episode(
                 )
             )
 
-            next_obs = _build_observation(next_proprio, camera_manager, camera_mapping, language)
+            next_obs = _build_observation(
+                next_proprio,
+                camera_manager,
+                camera_mapping,
+                language,
+                frame_cache=frame_cache,
+            )
             trans: dict[str, Any] = {
                 "state": current_state.tolist(),
                 "action": action.tolist(),
@@ -206,7 +341,7 @@ def main() -> None:
     parser.add_argument("--episodes", type=int, default=None)
     parser.add_argument("--max-steps", type=int, default=None)
     parser.add_argument("--gpu-host", default=None, help="Override gpu_server.host / GPU_SERVER_HOST")
-    parser.add_argument("--reset-mode", default=None, choices=["demo", "home", "none"])
+    parser.add_argument("--reset-mode", default=None, choices=["demo", "demo_fast", "workspace", "home", "none"])
     parser.add_argument("--no-cameras", action="store_true")
     args = parser.parse_args()
 
@@ -215,6 +350,7 @@ def main() -> None:
     apply_deoxys_paths(raw, smq_root=Path(__file__).resolve().parents[4])
 
     rl = raw.get("online_rl", {})
+    sc = raw.get("sft_collection", {})
     vla = raw.get("vla", {})
     paths = raw.get("paths", {})
     chunk_length = rl.get("chunk_length", 10)
@@ -223,6 +359,18 @@ def main() -> None:
     max_steps = args.max_steps or int(os.environ.get("MAX_STEPS", rl.get("max_steps_per_episode", 200)))
     episodes = args.episodes or int(os.environ.get("EPISODES", rl.get("max_episodes", 10)))
     language = vla.get("language_instruction", "")
+    post_reset_settle_sec = float(
+        rl.get("post_reset_settle_sec", sc.get("post_reset_settle_sec", 1.0))
+    )
+    post_reset_warmup_steps = int(
+        rl.get("post_reset_warmup_steps", sc.get("post_reset_warmup_steps", 25))
+    )
+    post_reset_max_pos_err_m = float(
+        rl.get(
+            "post_reset_max_pos_err_m",
+            collection_reset_settings(resolve_reset_yaml(raw, smq_root=Path(__file__).resolve().parents[3]))[1].pos_tol_m * 2.0,
+        )
+    )
 
     rlt_root = Path(__file__).resolve().parents[3]
     log_dir = Path(paths.get("log_dir", "logs"))
@@ -260,6 +408,11 @@ def main() -> None:
 
     camera_manager = None
     camera_mapping: dict[str, str] = {}
+    camera_frame_cache: dict[str, np.ndarray] = {}
+
+    cam_cfg = raw.get("cameras", {})
+    img_size_raw = cam_cfg.get("image_size")
+    image_size = tuple(img_size_raw) if img_size_raw else None
 
     if env_mock:
         proprio_dim = raw["robot"]["proprio_dim"]
@@ -293,12 +446,25 @@ def main() -> None:
         env = create_robot_env(raw, rlt_root=rlt_root)
         if not args.no_cameras:
             camera_manager, camera_mapping = _setup_cameras(raw, raw["robot"])
+            if camera_manager is not None:
+                console.print("[cyan]Warming RealSense frame cache ...[/cyan]")
+                wait_for_rgb_frames(
+                    camera_manager,
+                    camera_mapping,
+                    cache=camera_frame_cache,
+                    timeout_sec=15.0,
+                )
+                shapes = {k: v.shape for k, v in camera_frame_cache.items()}
+                console.print(
+                    f"[green]Cameras ready[/green] cache={sorted(camera_frame_cache.keys())} "
+                    f"shapes={shapes}"
+                )
         if isinstance(gpu, MockGPUClient):
             console.print("[green]Real robot env[/green] [dim](mock GPU — zero actions)[/dim]")
         else:
             console.print(f"[green]Real robot env[/green] [cyan]GPU ws://{gpu_host}[/cyan]")
 
-    reset_manager = ResetManager.from_config(env, raw) if not env_mock else None
+    reset_manager = ResetManager.from_config(env, raw, rlt_root=rlt_root) if not env_mock else None
     if reset_manager is not None and args.reset_mode:
         from rlt.hardware.deoxys.reset_manager import ResetMode
 
@@ -306,7 +472,7 @@ def main() -> None:
     if reset_manager is not None:
         console.print(
             f"[cyan]Reset mode[/cyan]: {reset_manager.mode.value} "
-            f"(demo → home joints then random critical pose from data/plug_insertion)"
+            f"(bash scripts/reset_to_init.sh — external subprocess per episode)"
         )
 
     console.print(
@@ -319,11 +485,70 @@ def main() -> None:
     try:
         with key_ctx:
             for ep in range(episodes):
+                reset_info: dict = {}
+                use_external_reset = (
+                    reset_manager is not None
+                    and reset_manager.mode.value == "workspace"
+                    and reset_manager.reset_method == "external"
+                )
+                if use_external_reset and camera_manager is not None:
+                    console.print(
+                        "[cyan]Stopping cameras before external reset "
+                        "(camera child processes inherit ZMQ port 5555)[/cyan]"
+                    )
+                    camera_manager.stop()
+                    camera_manager = None
+                    flush_rgb_frame_cache(camera_frame_cache)
+
                 if reset_manager is not None:
                     proprio, reset_info = reset_manager.reset()
                     console.print(f"Reset ep {ep}: {reset_info}")
+                    if not env_mock:
+                        _verify_reset_pose(
+                            env,
+                            reset_info,
+                            max_pos_err_m=post_reset_max_pos_err_m,
+                        )
                 elif hasattr(env, "reset"):
                     env.reset()
+
+                if use_external_reset and not args.no_cameras and cam_cfg.get("mapping"):
+                    console.print("[cyan]Restarting cameras after external reset ...[/cyan]")
+                    camera_manager, camera_mapping = _setup_cameras(raw, raw["robot"])
+                    wait_for_rgb_frames(
+                        camera_manager,
+                        camera_mapping,
+                        cache=camera_frame_cache,
+                        timeout_sec=15.0,
+                    )
+
+                if camera_manager is not None:
+                    console.print(
+                        f"[cyan]Post-reset settle[/cyan] {post_reset_settle_sec:.1f}s + "
+                        f"fresh cameras (clearing stale cache)"
+                    )
+                    wait_for_fresh_rgb_frames(
+                        camera_manager,
+                        camera_mapping,
+                        cache=camera_frame_cache,
+                        timeout_sec=10.0,
+                        settle_sec=post_reset_settle_sec,
+                    )
+                    _post_reset_warmup(
+                        env,
+                        steps=post_reset_warmup_steps,
+                        control_hz=control_hz,
+                        camera_manager=camera_manager,
+                        camera_mapping=camera_mapping,
+                        frame_cache=camera_frame_cache,
+                    )
+                    if reset_info.get("target_xyz") and hasattr(env, "get_proprio"):
+                        target_z = float(reset_info["target_xyz"][2])
+                        live_z = float(env.get_proprio()[2])
+                        console.print(
+                            f"[green]Ready for VLA[/green] target_z={target_z:.4f}m "
+                            f"live_z={live_z:.4f}m Δz={(live_z - target_z)*100:.2f}cm"
+                        )
 
                 run_episode(
                     env,
@@ -337,6 +562,8 @@ def main() -> None:
                     camera_mapping=camera_mapping,
                     log_dir=log_dir,
                     episode_index=ep,
+                    image_size=image_size,
+                    frame_cache=camera_frame_cache,
                 )
     finally:
         if camera_manager is not None:

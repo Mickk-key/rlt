@@ -36,13 +36,48 @@ online_rl:
   control_hz: 20
   max_steps_per_episode: 200
   max_episodes: 50
-  reset_mode: demo_fast
-  post_reset_wait_sec: 0.2
+  reset_mode: workspace
+  # Use the same yaml as ``bash scripts/reset_to_init.sh`` for init-cube reset.
+  reset_config: configs/sft_plug_insertion.yaml
+  # external = subprocess reset_to_init.sh (release ZMQ, dedicated reset client)
+  reset_method: external
+  post_reset_wait_sec: 0.5
+  # Match SFT: let OSC settle + drain stale RealSense frames before first VLA infer.
+  post_reset_settle_sec: 1.0
+  post_reset_warmup_steps: 25
+  post_reset_max_pos_err_m: 0.03
+  use_workspace_reset: true
+  # GPU/VLA reference actions are physical EE deltas (m) — same as NPZ, not spacemouse units.
+  action_is_physical: true
 
 gpu_server:
   mock: false
   host: "10.176.53.120"
   port: 8765
+  # First openpi VLA infer can be slow (CUDA warmup); default client wait is 180s.
+  infer_timeout_sec: 180
+
+# Same init-cube reset as SFT collection (configs/sft_plug_insertion.yaml).
+sft_collection:
+  fps: 50
+  reset_pos_tol_m: 0.015
+  joint_home_if_delta_above_m: 0.35
+  approach_xy_first: true
+  workspace_randomization:
+    enabled: true
+    bottom_center_xyz:
+      - 0.6487597823143005
+      - 0.008056552149355412
+      - 0.20196470618247986
+    reference_quat:
+      - 0.014823771081864834
+      - 0.9990329742431641
+      - 0.013332861475646496
+      - -0.03918664902448654
+    gripper_width: 0.08
+    xy_half_range_m: 0.05
+    z_range_m: 0.0
+    seed: null
 
 data_collection:
   fps: 20
@@ -60,34 +95,7 @@ data_collection:
     - 0.18787272
     - 1.7980539
     - 0.81746185
-  use_demo_reset: true
-  # Resolved via paths.demo_reset_path (SMQ root relative); legacy fallback data/plug_insertion
-  demo_reset_path: rlt_project/rlt_reproduce/data/plug_insertion
-  demo_reset_pos_tol_m: 0.06
-  demo_reset_rot_tol_deg: 5.0
-  demo_reset_trim_orientation: false
-  demo_reset_require_home_first: false
-  # home_mode: hover = OSC to hover above target demo (z~0.25), NOT joint home (z~0.61 teleop pose)
-  demo_reset_home_mode: hover
-  demo_reset_pin_episode: ep_00022
-  demo_reset_approach_clearance_m: 0.05
-  demo_reset_min_hover_z_m: 0.20
-  demo_reset_position_tol_m: 0.05
-  demo_reset_position_max_rounds: 10
-  demo_reset_position_min_steps: 40
-  demo_reset_position_max_steps: 350
-  demo_reset_direct_move_under_m: 0.12
-  demo_reset_max_pos_delta_m: 0.50
-  demo_reset_min_target_z_m: 0.12
-  demo_reset_max_target_z_m: 0.80
-  demo_reset_joint_timeout: 12.0
-  demo_reset_post_home_wait_sec: 0.2
-  demo_reset_gripper_hold_closed: true
-  # demo_fast: skip reset motion if already within 6cm of pinned demo
-  demo_reset_skip_if_within_m: 0.06
-  demo_reset_home_fallback_delta_m: 0.50
-  # Optional: lower joint home only when home_mode=joint (teleop reset_joint_positions stays high)
-  # demo_reset_home_joints: [j1, j2, j3, j4, j5, j6, j7]
+  use_demo_reset: false
   joint_controller_cfg: joint-position-controller.yml
 
 paths:
@@ -95,10 +103,11 @@ paths:
   checkpoint_dir: checkpoints
   log_dir: logs
   output_dir: outputs
-  episodes_dir: data/episodes/plug_insertion
-  sft_episodes_dir: data/sft/plug_insertion
-  embeddings_dir: data/embeddings/plug_insertion
+  # Current SFT training / collection data (122+ episodes)
+  sft_episodes_dir: rlt_project/rlt_reproduce/data/sft/plug_insertion
   export_dir: data/export_for_gpu
-  demo_reset_path: rlt_project/rlt_reproduce/data/plug_insertion
+  # Legacy critical-phase demos (101 eps, no longer used for reset or training)
+  legacy_demo_reset_json: rlt_project/rlt_reproduce/data/legacy_critical_demo_json_101eps
+  legacy_episodes_npz: rlt_project/rlt_reproduce/data/episodes/legacy_critical_npz_101eps
 
 device: cpu

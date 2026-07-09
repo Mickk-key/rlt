@@ -326,8 +326,7 @@ def main() -> None:
                         joint_controller_cfg=joint_reset_cfg,
                         osc_position_cfg=osc_position_cfg,
                         ws_cfg=ws_cfg,
-                        sft_cfg=sc,
-                        pos_tol_m=float(sc.get("reset_pos_tol_m", 0.015)),
+                        raw=raw,
                         logger=console,
                     )
                     last_reset_offset = ws_result.offset_xyz[:2].tolist()

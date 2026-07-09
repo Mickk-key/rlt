@@ -79,6 +79,44 @@ def read_rgb_frames(
     return images
 
 
+def flush_rgb_frame_cache(cache: dict[str, np.ndarray] | None) -> None:
+    """Drop cached RGB so the next read cannot reuse pre-reset frames."""
+    if cache is not None:
+        cache.clear()
+
+
+def drain_camera_frames(camera_manager, *, n_reads: int = 8, sleep_sec: float = 0.05) -> None:
+    """Consume pending shm frames so subsequent reads reflect the settled scene."""
+    for _ in range(n_reads):
+        camera_manager.get_all_latest_frames()
+        time.sleep(sleep_sec)
+
+
+def wait_for_fresh_rgb_frames(
+    camera_manager,
+    camera_mapping: dict[str, str],
+    *,
+    cache: dict[str, np.ndarray] | None = None,
+    timeout_sec: float = 10.0,
+    settle_sec: float = 1.0,
+    drain_reads: int = 8,
+) -> dict[str, np.ndarray]:
+    """After arm reset: settle, drain stale frames, then require a full fresh cache."""
+    if cache is None:
+        cache = {}
+    flush_rgb_frame_cache(cache)
+    if settle_sec > 0:
+        time.sleep(settle_sec)
+    drain_camera_frames(camera_manager, n_reads=drain_reads)
+    flush_rgb_frame_cache(cache)
+    return wait_for_rgb_frames(
+        camera_manager,
+        camera_mapping,
+        cache=cache,
+        timeout_sec=timeout_sec,
+    )
+
+
 def wait_for_rgb_frames(
     camera_manager,
     camera_mapping: dict[str, str],

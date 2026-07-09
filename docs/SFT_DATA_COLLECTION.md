@@ -132,7 +132,31 @@ data/sft/plug_insertion/
 WRITE=1 bash scripts/record_bottom_center.sh
 ```
 
-`bottom_center_xyz` = 你标定的插座正上方 EE 点 = **立方体底面中心**（不是旧 demo 的插入高度 0.189m）。
+`bottom_center_xyz` = 你标定的插座正上方 EE 点 = **立方体底面中心**（当前约 z≈0.202 m）。  
+**Online RL actor 与 SFT 采集共用同一套 reset**（`configs/sft_plug_insertion.yaml`）。
+
+### 单独测 reset（不采集）
+
+先启动机械臂：
+
+```bash
+cd "/home/host5010/workspaces/smq&jgy"
+bash scripts/start_robot.sh
+```
+
+```bash
+bash scripts/reset_to_init.sh           # 随机 init cube（默认）
+FIXED=1 bash scripts/reset_to_init.sh   # 固定底面中心
+```
+
+标定 / 更新底面中心（换插座时）：
+
+```bash
+bash scripts/record_bottom_center.sh          # 预览
+WRITE=1 bash scripts/record_bottom_center.sh  # 写入 yaml
+```
+
+`workspace_randomization`（`configs/sft_plug_insertion.yaml`）：
 
 ```yaml
 workspace_randomization:
@@ -141,12 +165,7 @@ workspace_randomization:
   z_range_m: 0.0            # 仅底面；>0 则向上随机
 ```
 
-**Reset 运动**：先 **xy 平移**（保持当前高度）→ 再 **仅降 z**，且 **不会低于 bottom_center.z**（避免斜线穿到插头下方）。
-
-```bash
-bash scripts/reset_to_init.sh           # 随机
-FIXED=1 bash scripts/reset_to_init.sh     # 固定底面中心
-```
+**Reset 运动**：先 **xy 平移**（保持当前高度）→ 再 **仅降 z**，且 **不会低于 bottom_center.z**。
 
 ---
 
@@ -209,7 +228,7 @@ python -m rlt.scripts.extract_vla_embeddings --config configs/sft_plug_insertion
 ### 机械臂 / 遥操
 
 - [ ] SpaceMouse 右键后不动 → 已修复（`acknowledge_spacemouse_reset`）；若仍卡住，重启采集脚本
-- [ ] reset 超时 → 缩小 `xy_half_range_m` 或检查碰撞；查看 `[demo_reset]` 日志
+- [ ] reset 超时 → 缩小 `xy_half_range_m` 或检查碰撞；先单独跑 `bash scripts/reset_to_init.sh` 看日志
 - [ ] 夹爪不闭合 → 确认 Terminal 2 夹爪服务正常；按 **g** 或 SpaceMouse 左键
 
 ### 数据质量

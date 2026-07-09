@@ -41,13 +41,13 @@ def main() -> None:
     parser.add_argument(
         "--src",
         type=Path,
-        default=Path("data/episodes/plug_insertion"),
-        help="Directory containing NPZ episodes",
+        default=Path("data/episodes/legacy_critical_npz_101eps"),
+        help="Directory containing legacy NPZ episodes",
     )
     parser.add_argument(
         "--out",
         type=Path,
-        default=Path("data/plug_insertion"),
+        default=Path("data/legacy_critical_demo_json_101eps"),
         help="Output directory for per-episode JSON initial states",
     )
     args = parser.parse_args()

@@ -57,6 +57,14 @@ online_rl:
   critic_ensemble: 2
   target_update_tau: 0.005
   max_episodes: 100
+  # Online RL checkpointing (GPU rl_server)
+  checkpoint_save_interval_updates: 50
+  checkpoint_keep_last: 5
+  checkpoint_save_on_shutdown: true
+
+inference:
+  mode: reference
+  reference_noise_std: 0.05
 
 data_collection:
   fps: 20

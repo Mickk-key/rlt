@@ -15,12 +15,16 @@ from rlt.hardware.deoxys.demo_reset import (
     move_to_demo_pose,
     safety_config_from_yaml,
 )
+from rlt.hardware.deoxys.collection_reset import collection_reset_settings, resolve_reset_yaml
+from rlt.hardware.deoxys.fast_reset import InitCubeConfig
+from rlt.hardware.workspace_reset import reset_random_workspace
 from rlt.hardware.deoxys_arm import DummyArmBackend, o_t_ee_to_pose
 from rlt.hardware.franka.gripper import FrankaConfig, FrankaGripperAdapter
 from rlt.teleop.spacemouse_control import apply_gripper_latch
 from rlt.util.deoxys_paths import (
     default_osc_controller_cfg_name,
     resolve_controller_cfg_path,
+    resolve_demo_reset_path,
     smq_root_from_rlt,
 )
 
@@ -49,6 +53,12 @@ class DeoxysEnvConfig:
     gripper_latch: bool = True
     demo_reset_gripper_hold_closed: bool = True
     demo_reset_pin_episode: str | None = None
+    use_workspace_reset: bool = False
+    workspace_randomization: InitCubeConfig | None = None
+    sft_reset_yaml: dict = field(default_factory=dict)
+    reset_raw: dict = field(default_factory=dict)
+    # GPU/VLA actions are physical EE deltas (m, rad) like NPZ; teleop uses normalized spacemouse units.
+    action_is_physical: bool = False
 
 
 class DeoxysEnv:
@@ -67,6 +77,7 @@ class DeoxysEnv:
         self._demo_sampler: DemoResetSampler | None = None
         self._last_reset_info: dict = {}
         self._gripper_latched = False
+        self._workspace_cfg = cfg.workspace_randomization
 
         if cfg.use_demo_reset and cfg.demo_reset_path:
             self._demo_safety = safety_config_from_yaml(
@@ -80,52 +91,84 @@ class DeoxysEnv:
             )
 
         if cfg.backend == "deoxys":
-            root = Path(cfg.deoxys_root).resolve()
-            if str(root) not in sys.path:
-                sys.path.insert(0, str(root))
-            from deoxys import config_root
-            from deoxys.franka_interface import FrankaInterface
-            from deoxys.utils import YamlConfig
-            from deoxys.utils.config_utils import get_default_controller_config
-
-            interface_path = cfg.deoxys_config
-            if not interface_path.startswith("/"):
-                candidate = Path(config_root) / Path(interface_path).name
-                interface_path = str(candidate if candidate.is_file() else interface_path)
-
-            self._iface = FrankaInterface(
-                interface_path,
-                control_freq=cfg.control_hz,
-                has_gripper=True,
-                automatic_gripper_reset=False,
-            )
-            self._controller_cfg = get_default_controller_config(cfg.controller_type)
-            if cfg.controller_cfg_name:
-                cfg_path = resolve_controller_cfg_path(
-                    cfg.controller_cfg_name,
-                    smq_root=smq_root_from_rlt(),
-                    deoxys_config_root=config_root,
-                )
-                user_cfg = YamlConfig(str(cfg_path)).as_easydict()
-                self._controller_cfg = user_cfg
-
-            joint_cfg_path = resolve_controller_cfg_path(
-                cfg.joint_controller_cfg_name,
-                smq_root=smq_root_from_rlt(),
-                deoxys_config_root=config_root,
-            )
-            self._joint_controller_cfg = YamlConfig(str(joint_cfg_path)).as_easydict()
-            osc_pos_path = resolve_controller_cfg_path(
-                "configs/deoxys/osc-position-controller.yml",
-                smq_root=smq_root_from_rlt(),
-                deoxys_config_root=config_root,
-            )
-            self._osc_position_cfg = YamlConfig(str(osc_pos_path)).as_easydict()
-            gripper_cfg = FrankaConfig.from_yaml(Path(cfg.gripper_config))
-            self._gripper = FrankaGripperAdapter(self._iface, gripper_cfg)
-            time.sleep(0.5)
+            self._connect_deoxys()
         else:
             self._arm = DummyArmBackend()
+
+    def _connect_deoxys(self, *, control_hz: float | None = None) -> None:
+        cfg = self.cfg
+        root = Path(cfg.deoxys_root).resolve()
+        if str(root) not in sys.path:
+            sys.path.insert(0, str(root))
+        from deoxys import config_root
+        from deoxys.franka_interface import FrankaInterface
+        from deoxys.utils import YamlConfig
+        from deoxys.utils.config_utils import get_default_controller_config
+
+        interface_path = cfg.deoxys_config
+        if not interface_path.startswith("/"):
+            candidate = Path(config_root) / Path(interface_path).name
+            interface_path = str(candidate if candidate.is_file() else interface_path)
+
+        hz = control_hz if control_hz is not None else cfg.control_hz
+        self._iface = FrankaInterface(
+            interface_path,
+            control_freq=hz,
+            has_gripper=True,
+            automatic_gripper_reset=False,
+        )
+        self._controller_cfg = get_default_controller_config(cfg.controller_type)
+        if cfg.controller_cfg_name:
+            cfg_path = resolve_controller_cfg_path(
+                cfg.controller_cfg_name,
+                smq_root=smq_root_from_rlt(),
+                deoxys_config_root=config_root,
+            )
+            user_cfg = YamlConfig(str(cfg_path)).as_easydict()
+            self._controller_cfg = user_cfg
+
+        joint_cfg_path = resolve_controller_cfg_path(
+            cfg.joint_controller_cfg_name,
+            smq_root=smq_root_from_rlt(),
+            deoxys_config_root=config_root,
+        )
+        self._joint_controller_cfg = YamlConfig(str(joint_cfg_path)).as_easydict()
+        osc_pos_path = resolve_controller_cfg_path(
+            "configs/deoxys/osc-position-controller.yml",
+            smq_root=smq_root_from_rlt(),
+            deoxys_config_root=config_root,
+        )
+        self._osc_position_cfg = YamlConfig(str(osc_pos_path)).as_easydict()
+        gripper_cfg = FrankaConfig.from_yaml(Path(cfg.gripper_config))
+        self._gripper = FrankaGripperAdapter(self._iface, gripper_cfg)
+        time.sleep(0.5)
+
+    def suspend_deoxys_client(self) -> None:
+        """Close FrankaInterface so reset_to_init.sh can own ZMQ port 5555."""
+        import gc
+
+        if self._gripper is not None:
+            try:
+                self._gripper.cleanup()
+            except Exception:
+                pass
+            self._gripper = None
+        if self._iface is not None:
+            try:
+                self._iface.close()
+            except Exception:
+                pass
+            self._iface = None
+        gc.collect()
+        time.sleep(0.5)
+
+    def resume_deoxys_client(self) -> None:
+        """Reconnect after external reset subprocess (RL control at robot.control_hz)."""
+        if self.cfg.backend != "deoxys":
+            return
+        if self._iface is not None:
+            return
+        self._connect_deoxys(control_hz=self.cfg.control_hz)
 
     @property
     def pose_ready(self) -> bool:
@@ -145,6 +188,16 @@ class DeoxysEnv:
         pos, quat = o_t_ee_to_pose(st.O_T_EE)
         width = np.array([self._gripper.position], dtype=np.float32)
         return np.concatenate([pos, quat, width]).astype(np.float32)
+
+    def _controller_action_scales(self) -> tuple[float, float]:
+        if self._controller_cfg is None:
+            return 0.05, 1.0
+        scale = self._controller_cfg.action_scale
+        if hasattr(scale, "translation"):
+            return float(scale.translation), float(scale.rotation)
+        if isinstance(scale, dict):
+            return float(scale.get("translation", 0.05)), float(scale.get("rotation", 1.0))
+        return 0.05, 1.0
 
     def _apply_demo_reset(self, *, fast: bool = False) -> None:
         if self._demo_sampler is None or self._iface is None:
@@ -193,19 +246,55 @@ class DeoxysEnv:
             f"[demo_reset] success episode_id={target.episode_id} demo_index={sample['demo_index']}"
         )
 
+    def _apply_workspace_reset(self) -> None:
+        if self._iface is None or self._workspace_cfg is None:
+            self._pose_ready = True
+            self._last_reset_info = {"workspace_reset": False}
+            return
+
+        sc = self.cfg.sft_reset_yaml or {}
+        print("[collection_reset] init cube reset (same as bash scripts/reset_to_init.sh)")
+        ws_result = reset_random_workspace(
+            self._iface,
+            gripper=self._gripper,
+            joint_controller_cfg=self._joint_controller_cfg,
+            osc_position_cfg=self._osc_position_cfg,
+            ws_cfg=self._workspace_cfg,
+            raw=self.cfg.reset_raw or {"sft_collection": sc, "data_collection": self.cfg.demo_reset_yaml},
+        )
+        self._pose_ready = True
+        self._last_reset_info = {
+            "workspace_reset": True,
+            "episode_id": ws_result.episode_id,
+            "target_xyz": ws_result.target_xyz.tolist(),
+            "offset_xy_cm": [round(float(x) * 100, 2) for x in ws_result.offset_xy],
+            **ws_result.reset_info,
+        }
+        print(
+            f"[collection_reset] target={ws_result.target_xyz.round(4).tolist()} "
+            f"offset_xy(cm)={self._last_reset_info['offset_xy_cm']} "
+            f"err={ws_result.reset_info.get('pos_err_m', 0)*100:.2f}cm"
+        )
+
     def reset(self, *, fast: bool = False) -> np.ndarray:
         self._step = 0
         self._pose_ready = False
         self._gripper_latched = bool(
             self.cfg.gripper_latch
-            and (self.cfg.demo_reset_gripper_hold_closed or not self.cfg.use_demo_reset)
+            and (
+                self.cfg.use_workspace_reset
+                or self.cfg.demo_reset_gripper_hold_closed
+                or not self.cfg.use_demo_reset
+            )
         )
 
-        if self.cfg.use_demo_reset:
+        if self.cfg.use_workspace_reset:
+            self._apply_workspace_reset()
+        elif self.cfg.use_demo_reset:
             self._apply_demo_reset(fast=fast)
         else:
             self._pose_ready = True
-            self._last_reset_info = {"demo_reset": False}
+            self._last_reset_info = {"demo_reset": False, "workspace_reset": False}
 
         return self.get_proprio()
 
@@ -221,17 +310,27 @@ class DeoxysEnv:
             enabled=self.cfg.gripper_latch,
         )
         pos_scale, rot_scale, grip_scale = self.cfg.action_scale
+        ctrl_trans, ctrl_rot = self._controller_action_scales()
 
         if self._iface is None:
             arm_cmd = action[:6].copy()
-            arm_cmd[:3] *= pos_scale
-            arm_cmd[3:6] *= rot_scale
+            if self.cfg.action_is_physical:
+                arm_cmd[:3] /= max(ctrl_trans, 1e-8)
+                arm_cmd[3:6] /= max(ctrl_rot, 1e-8)
+            else:
+                arm_cmd[:3] *= pos_scale
+                arm_cmd[3:6] *= rot_scale
             self._arm.send_cartesian_delta(arm_cmd)
         else:
             cmd = action.copy()
-            cmd[:3] *= pos_scale
-            cmd[3:6] *= rot_scale
-            if cmd.shape[0] >= 7:
+            if self.cfg.action_is_physical:
+                # VLA/NPZ deltas in meters — convert to deoxys cmd units (controller applies ctrl_*).
+                cmd[:3] /= max(ctrl_trans, 1e-8)
+                cmd[3:6] /= max(ctrl_rot, 1e-8)
+            else:
+                cmd[:3] *= pos_scale
+                cmd[3:6] *= rot_scale
+            if cmd.shape[0] >= 7 and not self.cfg.action_is_physical:
                 cmd[6] *= grip_scale
             self._iface.control(
                 controller_type=self.cfg.controller_type,
@@ -248,11 +347,8 @@ class DeoxysEnv:
         return self.get_proprio(), 0.0, False, info
 
     def close(self) -> None:
-        if self._gripper is not None:
-            self._gripper.cleanup()
-        if self._iface is not None:
-            self._iface.close()
-        elif hasattr(self, "_arm"):
+        self.suspend_deoxys_client()
+        if hasattr(self, "_arm") and self.cfg.backend != "deoxys":
             self._arm.close()
 
     @classmethod
@@ -261,11 +357,30 @@ class DeoxysEnv:
         gripper = raw.get("gripper", {})
         rl = raw.get("online_rl", {})
         dc = raw.get("data_collection", {})
+        sc = raw.get("sft_collection", {})
 
-        demo_path = dc.get("demo_reset_path") or raw.get("paths", {}).get("demo_reset_path") or raw.get("paths", {}).get("episodes_dir", "")
-        if demo_path and rlt_root is not None and not Path(demo_path).is_absolute():
-            smq = smq_root_from_rlt(rlt_root)
-            demo_path = str(resolve_demo_reset_path(raw, smq_root=smq))
+        smq = smq_root_from_rlt(rlt_root)
+        reset_raw = resolve_reset_yaml(raw, smq_root=smq)
+        reset_sc = reset_raw.get("sft_collection", sc)
+        reset_dc = reset_raw.get("data_collection", dc)
+
+        reset_mode = rl.get("reset_mode", "")
+        use_workspace = bool(
+            rl.get("use_workspace_reset", reset_mode in ("workspace", "init_cube", "sft"))
+        )
+        ws_raw = reset_sc.get("workspace_randomization", dc.get("workspace_randomization", {}))
+        workspace_cfg = InitCubeConfig.from_yaml_dict(ws_raw) if ws_raw else None
+
+        demo_path = ""
+        if dc.get("use_demo_reset"):
+            demo_path = (
+                dc.get("demo_reset_path")
+                or raw.get("paths", {}).get("demo_reset_path")
+                or raw.get("paths", {}).get("episodes_dir", "")
+            )
+            if demo_path and rlt_root is not None and not Path(demo_path).is_absolute():
+                smq = smq_root_from_rlt(rlt_root)
+                demo_path = str(resolve_demo_reset_path(raw, smq_root=smq))
 
         return cls(
             DeoxysEnvConfig(
@@ -280,7 +395,7 @@ class DeoxysEnv:
                 action_dim=rl.get("action_dim", 7),
                 gripper_config=gripper.get("config", "configs/franka/franka_hand.yaml"),
                 chunk_length=rl.get("chunk_length", 10),
-                use_demo_reset=bool(dc.get("use_demo_reset", False)),
+                use_demo_reset=bool(dc.get("use_demo_reset", False)) and not use_workspace,
                 demo_reset_path=str(demo_path),
                 demo_reset_seed=dc.get("demo_reset_seed"),
                 demo_reset_pos_tol_m=float(dc.get("demo_reset_pos_tol_m", 0.01)),
@@ -291,5 +406,12 @@ class DeoxysEnv:
                 gripper_latch=bool(dc.get("gripper_latch", True)),
                 demo_reset_gripper_hold_closed=bool(dc.get("demo_reset_gripper_hold_closed", True)),
                 demo_reset_pin_episode=dc.get("demo_reset_pin_episode") or None,
+                use_workspace_reset=use_workspace,
+                workspace_randomization=workspace_cfg,
+                sft_reset_yaml={**reset_sc, "fps": reset_sc.get("fps", robot.get("control_hz", 20.0))},
+                reset_raw=reset_raw,
+                action_is_physical=bool(
+                    rl.get("action_is_physical", dc.get("action_is_physical", False))
+                ),
             )
         )

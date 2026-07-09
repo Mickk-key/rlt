@@ -5,7 +5,7 @@
 > 工作目录：`/home/host5010/workspaces/smq&jgy`  
 > **工控机 rollout 步骤**：[`docs/ONLINE_RL_ROBOT.md`](docs/ONLINE_RL_ROBOT.md)
 
-最后更新：**2026-07-02**
+最后更新：**2026-07-10**（reset 已改为 SFT init-cube external；详见 [`docs/ONLINE_RL_ROBOT.md`](docs/ONLINE_RL_ROBOT.md)）
 
 ---
 
@@ -184,25 +184,27 @@ MOCK=1 bash scripts/run_deoxys_actor.sh --mock --episodes 1   # 全 mock
 cd "/home/host5010/workspaces/smq&jgy"
 export GPU_SERVER_HOST=127.0.0.1
 
-# 建议先 1 个 episode 试手感
-CONFIRM=1 EPISODES=1 RESET_MODE=demo bash scripts/run_deoxys_actor.sh
+# 建议先 1–2 个 episode 试手感（reset 同 bash scripts/reset_to_init.sh）
+CONFIRM=1 bash scripts/run_deoxys_actor.sh --episodes 2 --max-steps 200
 
-# 熟练后多 episode（config 默认 max 200 step/episode）
-CONFIRM=1 EPISODES=10 RESET_MODE=demo bash scripts/run_deoxys_actor.sh
+# 阶段 A：多 episode 标 s/f
+CONFIRM=1 bash scripts/run_deoxys_actor.sh --episodes 10 --max-steps 200
 ```
 
 可选参数：
 
 | 变量 / 参数 | 含义 | 默认 |
 |-------------|------|------|
-| `RESET_MODE=demo` | 从 demo JSON 随机初始位姿（~30s/次） | yaml 里 `demo` |
-| `RESET_MODE=home` | 关节 home，更快 | |
-| `MAX_STEPS=150` | 超时自动 fail（reward=0） | 200 |
-| `EPISODES=N` | 连续 N 个 episode | 50 |
+| `--episodes N` | 连续 N 个 episode | yaml `max_episodes`（50） |
+| `--max-steps M` | 超时自动 fail（reward=0） | yaml `200` |
+| `MOCK=1` | 不连机械臂 | — |
+| `CONFIRM=1` | 实机确认 | 真机必须 |
+
+Reset 由 yaml `online_rl.reset_method: external` 控制（**不再使用** `RESET_MODE=demo`）。
 
 ### Episode 里你要做什么
 
-1. **等 reset 完成**（demo reset 会 home → 移到 critical phase 起点，夹爪闭合）
+1. **等 external reset 完成**（子进程 `reset_to_init_pose`，init cube z≈0.202m）
 2. **机械臂开始动** — GPU 发 reference action（config 里 `inference.mode: reference`）
 3. **任务进行中**：观察插入是否成功
 4. **按键**（焦点在本终端）：
@@ -237,23 +239,23 @@ GPU 改 inference 模式：编辑 `configs/plug_insertion.yaml` 里 `inference.m
 # 1) 终端 B 确认隧道
 bash scripts/gpu/start_ssh_tunnel.sh
 
-# 2) 终端 C — 1 episode + home reset（比 demo 快）
+# 2) 终端 C — reference 试跑
 export GPU_SERVER_HOST=127.0.0.1
-CONFIRM=1 EPISODES=1 RESET_MODE=home MAX_STEPS=100 bash scripts/run_deoxys_actor.sh
-# 尝试在合适时机按 s 或 f
+CONFIRM=1 bash scripts/run_deoxys_actor.sh --episodes 2 --max-steps 200
+# 等日志 OK to start VLA 后观察臂动；适时按 s 或 f
 
 # 3) 确认日志
 ls logs/online_rl/rewards/
 cat logs/online_rl/rewards/ep_0000.json
 
-# 4) 正式 online RL — demo reset + 多 episode
-CONFIRM=1 EPISODES=5 RESET_MODE=demo bash scripts/run_deoxys_actor.sh
+# 4) 阶段 A — 多 episode 攒 buffer
+CONFIRM=1 bash scripts/run_deoxys_actor.sh --episodes 5 --max-steps 200
 ```
 
 ### 安全提醒
 
 - 第一次 reference rollout 前确认工作空间、急停可用
-- demo reset 会大幅移动机械臂（~30s），勿靠近
+- external reset 会移动机械臂到 init cube，勿靠近
 - 异常时终端 `Ctrl+C`，必要时物理急停
 
 ---
