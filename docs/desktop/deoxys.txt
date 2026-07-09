@@ -1,0 +1,70 @@
+# deoxys 真机流程（host5010 实测路径）
+# 推荐优先使用 smq&jgy/scripts/ 下的封装脚本（见文末对照表）
+
+terminal 1  连接机械臂
+cd ~/workspaces/wty/deoxys_control/deoxys
+conda activate franka_mani
+./auto_scripts/auto_arm.sh config/charmander.yml
+# smq 等价: cd ~/workspaces/smq&jgy && bash scripts/start_arm.sh
+
+terminal 2  连接夹爪
+cd ~/workspaces/wty/deoxys_control/deoxys
+conda activate franka_mani
+./auto_scripts/auto_gripper.sh config/charmander.yml
+# smq 等价: bash scripts/start_gripper.sh
+# 或一键: bash scripts/start_robot.sh
+
+terminal 3 遥操机械臂
+cd ~/workspaces/wty/deoxys_control/deoxys
+conda activate franka_mani
+python examples/run_deoxys_with_space_mouse.py
+# smq 推荐（右键复位不退出、左键 latch、o 手动松开）:
+#   cd ~/workspaces/smq&jgy && bash scripts/teleop_test.sh
+
+terminal 4  采机械臂数据
+cd ~/workspaces/wty/deoxys_control/deoxys
+conda activate franka_mani
+python examples/collect_low_dim_states_with_spacemouse.py
+# 注意: 原版 SpaceMouse 右键会 break 退出采集
+
+#replay
+python /home/host5010/workspaces/wty/deoxys_control/deoxys/examples/replay_low_dim_demonstration_trajectory.py
+# 原路径 /home/vla/... 在本机不存在，请用上式 host5010 路径
+
+terminal 5  打开相机
+cd ~/DannyControl
+conda activate DannyControl
+python robot_camera.py
+# [本机缺失] ~/DannyControl 与 DannyControl conda 环境不存在
+# smq 替代:
+#   cd ~/workspaces/smq&jgy && bash scripts/detect_cameras.sh
+#   bash scripts/test_camera.sh
+
+# 可视化相机
+cd ~/workspaces/wty/deoxys_control/deoxys
+conda activate franka_mani
+python examples/test_camera.py
+
+terminal 6 采集相机数据
+cd ~/DannyControl
+conda activate DannyControl
+python data_collect.py
+# [本机缺失] 同上
+# smq RLT 采集（critical phase + RealSense）:
+#   cd ~/workspaces/smq&jgy && bash scripts/collect_data.sh
+
+# 7 reset
+export PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python
+conda activate franka_mani
+deoxys.reset_joints
+# smq 等价: cd ~/workspaces/smq&jgy && bash scripts/reset_robot.sh
+
+# 同时采集相机和机械臂数据
+cd ~/workspaces/wty/deoxys_control/deoxys
+conda activate franka_mani
+python examples/collect_low_dim_states_with_realsense_sync.py
+# 注意: 依赖 Franka Hand gripper buffer；smq RLT 用 collect_data.sh
+
+记录位姿
+初始拍照位姿（关节角 rad，已写入 plug_insertion.yaml reset_joint_positions）
+0.05904578  0.52446592  -0.15976057   -0.76166065    0.18787272   1.7980539   0.81746185

@@ -5,9 +5,6 @@ set -euo pipefail
 RLT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export RLT_ROOT
 
-SMQ_ROOT="${SMQ_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)}"
-export SMQ_ROOT
-
 export DEOXYS_ROOT="${DEOXYS_ROOT:-${SMQ_ROOT}/third_party/deoxys}"
 if [[ ! -f "${DEOXYS_ROOT}/config/charmander.yml" ]]; then
   export DEOXYS_ROOT="/home/host5010/workspaces/wty/deoxys_control/deoxys"
@@ -24,6 +21,9 @@ export ROBOTIQ_PORT="${ROBOTIQ_PORT:-/dev/ttyUSB0}"
 
 export RLT_COLLECT_CONFIG="${RLT_COLLECT_CONFIG:-${RLT_ROOT}/configs/plug_insertion.yaml}"
 export PYTHONPATH="${RLT_ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}"
+
+SMQ_ROOT="${SMQ_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)}"
+export SMQ_ROOT
 export SMQ_DATA_DIR="${SMQ_DATA_DIR:-${SMQ_ROOT}/data}"
 export SMQ_LOG_DIR="${SMQ_LOG_DIR:-${SMQ_ROOT}/logs}"
 export SMQ_RUN_DIR="${SMQ_RUN_DIR:-${SMQ_LOG_DIR}/run}"

@@ -4,6 +4,10 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/_env.sh
 source "$SCRIPT_DIR/_env.sh"
+if [[ -f "$SCRIPT_DIR/robot/deoxys_actor.env" ]]; then
+  # shellcheck source=robot/deoxys_actor.env
+  source "$SCRIPT_DIR/robot/deoxys_actor.env"
+fi
 
 CONFIG="${1:-$RLT_COLLECT_CONFIG}"
 HOST="${GPU_SERVER_HOST:-${2:-}}"

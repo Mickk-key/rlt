@@ -1,0 +1,28 @@
+cd ~/workspaces/yjr/ConsVLA/RLinf
+source .venv/bin/activate
+bash examples/embodiment/collect_data.sh
+
+
+
+# 先用这个命令测一下任务重置的位置
+python -m toolkits.realworld_check.test_franka2_controller
+# 运行之后输入 getpos_euler获取位置
+
+
+camera_serials:
+      - '313522071149'
+      - '254522075549'
+
+
+
+pkill -9 -f joint_state_publisher; pkill -9 -f robot_state_publisher; pkill -9 -f ros2_control_node; pkill -9 -f franka_gripper_node; pkill -9 -f controller_manager; pkill -9 -f collect_real_data; pkill -9 -f Franka2Controller; pkill -9 -f test_franka2_controller
+ray stop --force
+# 查看残余进程
+ps aux | grep -E "ros2|franka|controller_manager|robot_state_publisher|joint_state" | grep -v grep
+
+
+ssh -p 26570 -i ~/.ssh/id_rsa yangjiarui@10.176.53.120
+
+
+  ROS_DOMAIN_ID=83 ROS_LOCALHOST_ONLY=1 bash examples/embodiment/collect_data.sh realworld_collect_data_pick_and_place_franka2
+

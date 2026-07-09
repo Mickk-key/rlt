@@ -1,28 +1,45 @@
-# Python
+# --- Large vendored deps (restore via scripts/robot/copy_deoxys_to_smq.sh) ---
+third_party/deoxys/
+
+# openpi / libero vendored in rlt_reproduce (reinstall via scripts/setup_env.sh)
+rlt_project/rlt_reproduce/third_party/
+
+# --- Data & artifacts (keep locally, do not version) ---
+data/
+logs/
+checkpoints/
+outputs/
+*.tar.gz
+*.npz
+*.npy
+*.pt
+data/episodes/
+data/export_for_gpu_host/
+
+# --- Python ---
 __pycache__/
 *.py[cod]
 *.egg-info/
 .venv/
 venv/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
 
-# Training / runtime artifacts
-checkpoints/
-logs/
-outputs/
-*.pt
-*.npz
-data/episodes/
-data/export_for_gpu_host/
-
-# Large vendored deps (sync separately)
-third_party/deoxys/
-
-# IDE / OS
-.DS_Store
-.idea/
+# --- IDE / OS ---
+.cursor/
 .vscode/
+.idea/
 *.swp
+*~
+.DS_Store
 
-# Secrets
+# --- Secrets ---
 .env
-*.key
+*.env.local
+scripts/robot/deoxys_actor.env
+
+# --- Build ---
+third_party/deoxys/**/build/
+**/CMakeFiles/
+**/cmake-build-*/

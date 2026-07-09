@@ -10,24 +10,27 @@ bash "$SCRIPT_DIR/free_cameras.sh"
 activate_robot_env
 ensure_smq_dirs
 
-# Default: auto-build mapping from connected cameras (override with CAMERA_MAPPING env)
+# Default: read cameras.mapping from RLT_COLLECT_CONFIG (NOT USB enumeration order).
 if [[ -z "${CAMERA_MAPPING:-}" ]]; then
-  CAMERA_MAPPING="$(python - <<'PY'
-import json, sys
+  CAMERA_MAPPING="$(python - <<PY
+import json, os, yaml
 from pathlib import Path
-sys.path.insert(0, "/home/host5010/workspaces/wty/deoxys_control/deoxys")
-from deoxys.camera import RealSenseCameraManager
-serials = RealSenseCameraManager.discover_cameras()
-names = ["wrist", "external", "third"]
-print(json.dumps({names[i]: s for i, s in enumerate(serials[:3])}))
+config = Path(os.environ["RLT_COLLECT_CONFIG"])
+with open(config) as f:
+    mapping = yaml.safe_load(f).get("cameras", {}).get("mapping", {})
+if not mapping:
+    raise SystemExit("cameras.mapping empty in " + str(config))
+print(json.dumps(mapping))
 PY
 )"
-  echo "Auto camera mapping: ${CAMERA_MAPPING}"
+  echo "Camera mapping from ${RLT_COLLECT_CONFIG}:"
+  echo "  ${CAMERA_MAPPING}"
+  echo "  (USB order may differ — verify wrist.png vs external.png visually)"
 fi
 
 if [[ -z "${DISPLAY:-}" ]]; then
   echo "==> No DISPLAY — headless camera test (saves PNG to ${SMQ_CAMERA_TEST_DIR}/)"
-  echo "    Tip: bash scripts/detect_cameras.sh  to list actual serials first"
+  echo "    Tip: bash scripts/detect_cameras.sh  to list USB serials"
   exec python "$SCRIPT_DIR/test_camera_headless.py" \
     --camera-mapping "$CAMERA_MAPPING" \
     "$@"

@@ -4,6 +4,10 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/_env.sh
 source "$SCRIPT_DIR/_env.sh"
+if [[ -f "$SCRIPT_DIR/robot/deoxys_actor.env" ]]; then
+  # shellcheck source=robot/deoxys_actor.env
+  source "$SCRIPT_DIR/robot/deoxys_actor.env"
+fi
 
 CONFIG="${RLT_COLLECT_CONFIG}"
 EXTRA_ARGS=()
@@ -31,6 +35,11 @@ RESET_MODE="${RESET_MODE:-}"
 GPU_SERVER_HOST="${GPU_SERVER_HOST:-}"
 GPU_SERVER_MOCK="${GPU_SERVER_MOCK:-}"
 CONFIRM="${CONFIRM:-0}"
+
+# Pure local mock: no GPU unless caller sets GPU_SERVER_HOST (e.g. tunnel pathway test).
+if [[ "$MOCK" == "1" && -z "$GPU_SERVER_HOST" && -z "$GPU_SERVER_MOCK" ]]; then
+  GPU_SERVER_MOCK=1
+fi
 
 if [[ "$MOCK" != "1" && "$CONFIRM" != "1" ]]; then
   echo "ERROR: 实机 actor loop 需要显式确认。" >&2
@@ -80,9 +89,11 @@ echo "==> RLT Actor Loop（本机 rollout）"
 echo "    config=${CONFIG}"
 echo "    mock=${MOCK}"
 echo "    GPU_SERVER_HOST=${GPU_SERVER_HOST:-<yaml>}"
+echo "    episodes=${EPISODES:-<yaml max_episodes, default 1>}"
+echo "    max_steps=${MAX_STEPS:-<yaml max_steps_per_episode, default 600>}"
 echo ""
 echo "【episode 进行中】 s=成功(reward=1)  f=失败  q=退出"
 echo "    日志: logs/online_rl/"
 echo ""
 
-exec python -m rlt.scripts.actor_loop --config "$CONFIG" "${ARGS[@]}" "${EXTRA_ARGS[@]}"
+exec python -m rlt.scripts.actor_loop "${ARGS[@]}" "${EXTRA_ARGS[@]}"

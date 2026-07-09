@@ -24,6 +24,7 @@ from rlt.hardware.deoxys.demo_reset import (
     pose_errors,
 )
 from rlt.hardware.deoxys.deoxys_env import DeoxysEnv
+from rlt.util.deoxys_paths import resolve_demo_reset_path
 
 
 @dataclass
@@ -38,15 +39,6 @@ class TrialResult:
     rot_err_deg: float | None
     gripper_err_mm: float | None
     error: str | None = None
-
-
-def _resolve_demo_path(raw: dict, rlt_root: Path, override: str | None) -> Path:
-    dc = raw.get("data_collection", {})
-    rel = override or dc.get("demo_reset_path") or raw.get("paths", {}).get("episodes_dir", "")
-    path = Path(rel)
-    if not path.is_absolute():
-        path = (rlt_root / path).resolve()
-    return path
 
 
 def _ensure_demo_json(demo_path: Path, episodes_dir: Path) -> None:
@@ -75,12 +67,18 @@ def _current_errors(env: DeoxysEnv, target: ResetPose) -> tuple[float, float, fl
     return pos_err * 100.0, rot_err, grip_err * 1000.0
 
 
-def run_trials_env(env: DeoxysEnv, *, trials: int, pause_sec: float) -> list[TrialResult]:
+def run_trials_env(
+    env: DeoxysEnv,
+    *,
+    trials: int,
+    pause_sec: float,
+    fast: bool = False,
+) -> list[TrialResult]:
     results: list[TrialResult] = []
     for i in range(trials):
         t0 = time.time()
         try:
-            proprio = env.reset()
+            proprio = env.reset(fast=fast)
             info = env.last_reset_info
             if not info.get("demo_reset"):
                 raise RuntimeError("use_demo_reset is false — enable it in config")
@@ -250,6 +248,12 @@ def main() -> int:
         help="env=DeoxysEnv.reset(); direct=move_to_demo_pose only",
     )
     parser.add_argument(
+        "--reset-mode",
+        choices=["demo", "demo_fast"],
+        default="demo",
+        help="demo=full home+demo; demo_fast=skip home when safe (online RL)",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Only validate demo JSON/NPZ loading; no robot connection",
@@ -263,12 +267,13 @@ def main() -> int:
     args = parser.parse_args()
 
     config_path = args.config.resolve()
-    rlt_root = config_path.parents[1]
+    smq_root = config_path.parents[1]
+    rlt_root = smq_root / "rlt_project" / "rlt_reproduce"
     with open(config_path) as f:
         raw = yaml.safe_load(f)
 
-    demo_path = _resolve_demo_path(raw, rlt_root, args.demo_path)
-    episodes_dir = (rlt_root / raw["paths"]["episodes_dir"]).resolve()
+    demo_path = resolve_demo_reset_path(raw, smq_root=smq_root, override=args.demo_path)
+    episodes_dir = (smq_root / raw["paths"]["episodes_dir"]).resolve()
     _ensure_demo_json(demo_path, episodes_dir)
 
     poses = load_reset_poses(demo_path)
@@ -284,8 +289,11 @@ def main() -> int:
 
     raw = dict(raw)
     raw.setdefault("data_collection", {})
+    raw.setdefault("paths", {})
     raw["data_collection"]["use_demo_reset"] = True
-    raw["data_collection"]["demo_reset_path"] = str(demo_path.relative_to(rlt_root))
+    raw["paths"]["demo_reset_path"] = str(
+        demo_path.relative_to(smq_root) if demo_path.is_relative_to(smq_root) else demo_path
+    )
 
     env = DeoxysEnv.from_rlt_config(raw, rlt_root=rlt_root)
     if env.cfg.backend != "deoxys":
@@ -296,13 +304,22 @@ def main() -> int:
     pos_lim = float(dc.get("demo_reset_pos_tol_m", 0.01)) * 100.0
     rot_lim = float(dc.get("demo_reset_rot_tol_deg", 5.0))
 
-    print(f"[run] {args.trials} trials mode={args.mode} pause={args.pause_sec}s")
+    fast = args.reset_mode == "demo_fast"
+    print(
+        f"[run] {args.trials} trials mode={args.mode} reset={args.reset_mode} "
+        f"pause={args.pause_sec}s"
+    )
     print(f"[run] thresholds: pos<={pos_lim:.1f}cm (rot logged, not required unless trim_orientation)")
 
     try:
         sampler = DemoResetSampler(demo_path)
         if args.mode == "env":
-            results = run_trials_env(env, trials=args.trials, pause_sec=args.pause_sec)
+            results = run_trials_env(
+                env,
+                trials=args.trials,
+                pause_sec=args.pause_sec,
+                fast=fast,
+            )
         else:
             results = run_trials_direct(env, sampler, trials=args.trials, pause_sec=args.pause_sec)
     finally:

@@ -1,8 +1,8 @@
 """Demo-driven reset: sample critical-phase initial poses from recorded demos.
 
 Motion pipeline (deoxys ``motion_utils`` only — no OSC pose slam):
-  1. ``reset_joints_to`` → home joints
-  2. Axis-decoupled ``position_only``: **xy at home z (z locked)** → **vertical z (xy locked)** → final z
+  1. ``home`` — ``joint`` (teleop joint home, z≈0.61) OR ``hover`` (OSC to hover above target demo, z≈0.25)
+  2. Axis-decoupled ``position_only``: **xy at current z** → **vertical z** → final demo xyz
 
 Target pose = ``proprio[0]`` of each collected episode (critical-phase start). This is
 **optional** for teleop collection (home reset via SpaceMouse RIGHT is the reliable default).
@@ -58,6 +58,11 @@ class DemoResetSafetyConfig:
     joint_reset_timeout: float = 12.0
     post_home_wait_sec: float = 0.4
     gripper_hold_closed: bool = True
+    skip_if_within_m: float = 0.0
+    home_fallback_delta_m: float = 0.35
+    home_mode: str = "joint"  # joint | hover — hover = OSC to hover above target demo (low z)
+    direct_move_under_m: float = 0.12  # total Δ below this → one-shot xyz move (not decoupled xy/z)
+    fast_reset: bool = False  # use fast_reset.fast_move_to_xyz (no xy/z segments)
 
 
 @dataclass(frozen=True)
@@ -223,6 +228,7 @@ class DemoResetSampler:
         *,
         seed: int | None = None,
         safety: DemoResetSafetyConfig | None = None,
+        pin_episode_id: str | None = None,
     ):
         safety = safety or DemoResetSafetyConfig()
         raw_poses = load_reset_poses(dataset_dir)
@@ -245,6 +251,20 @@ class DemoResetSampler:
             raise RuntimeError("No demo poses passed safety filters")
 
         self._rng = random.Random(seed)
+        self._pin_episode_id = pin_episode_id.strip() if pin_episode_id else None
+        if self._pin_episode_id:
+            self._pin_index = next(
+                (i for i, p in enumerate(self._poses) if p.episode_id == self._pin_episode_id),
+                None,
+            )
+            if self._pin_index is None:
+                raise ValueError(
+                    f"demo_reset_pin_episode={self._pin_episode_id!r} not in pool "
+                    f"({len(self._poses)} poses)"
+                )
+            print(f"[demo_reset] pinned episode {self._pin_episode_id} (index={self._pin_index})")
+        else:
+            self._pin_index = None
         self._last_index: int | None = None
         self._last_pose: ResetPose | None = None
 
@@ -252,7 +272,10 @@ class DemoResetSampler:
         return len(self._poses)
 
     def sample_reset_pose(self) -> dict:
-        idx = self._rng.randrange(len(self._poses))
+        if self._pin_index is not None:
+            idx = self._pin_index
+        else:
+            idx = self._rng.randrange(len(self._poses))
         self._last_index = idx
         self._last_pose = self._poses[idx]
         out = self._last_pose.as_dict()
@@ -352,6 +375,45 @@ def move_home_joints(
         time.sleep(safety.post_home_wait_sec)
 
 
+def _hover_xyz(target: ResetPose, safety: DemoResetSafetyConfig) -> np.ndarray:
+    tx, ty, tz = [float(v) for v in target.ee_pose]
+    hz = max(safety.min_hover_z_m, tz + safety.approach_clearance_m)
+    return np.array([tx, ty, hz], dtype=np.float64)
+
+
+def move_hover_home(
+    robot_interface,
+    target: ResetPose,
+    safety: DemoResetSafetyConfig,
+    *,
+    osc_position_cfg,
+) -> int:
+    """OSC position-only to hover above *this* demo target (z≈0.25), not joint home at z≈0.61."""
+    hover_pose = ResetPose(
+        ee_pose=_hover_xyz(target, safety).astype(np.float32),
+        quaternion=target.quaternion,
+        gripper_width=target.gripper_width,
+        episode_id=f"{target.episode_id}_hover",
+    )
+    pos = _current_ee_pos(robot_interface)
+    hz = hover_pose.ee_pose[2]
+    print(
+        f"[demo_reset] phase 0/2: hover home above {target.episode_id} "
+        f"xyz={np.round(hover_pose.ee_pose, 3).tolist()}"
+    )
+    waypoints = _position_waypoints(pos, hover_pose, safety)
+    total = 0
+    for i, segment in enumerate(waypoints):
+        total += _position_segment_until(
+            robot_interface,
+            segment,
+            osc_position_cfg=osc_position_cfg,
+            safety=safety,
+            label=f"hover{i+1}/{len(waypoints)} {segment.desc}",
+        )
+    return total
+
+
 def _position_waypoints(
     current_pos: np.ndarray,
     target: ResetPose,
@@ -363,7 +425,46 @@ def _position_waypoints(
     cx, cy, cz = [float(v) for v in current_pos.reshape(3)]
     segments: list[PositionSegment] = []
 
+    total_dist = float(np.linalg.norm([tx - cx, ty - cy, tz - cz]))
+    if safety.direct_move_under_m > 0 and total_dist <= safety.direct_move_under_m:
+        return [
+            PositionSegment(
+                target=np.array([tx, ty, tz]),
+                mode="full",
+                desc=f"direct Δ={total_dist*100:.1f}cm",
+            )
+        ]
+
     xy_dist = float(np.linalg.norm([tx - cx, ty - cy]))
+    near_height = abs(cz - tz) < 0.15
+
+    if near_height:
+        if xy_dist > 0.008:
+            segments.append(
+                PositionSegment(
+                    target=np.array([tx, ty, tz]),
+                    mode="full",
+                    desc=f"near-height direct xy Δ={xy_dist*100:.1f}cm",
+                )
+            )
+        elif abs(cz - tz) > 0.008:
+            segments.append(
+                PositionSegment(
+                    target=np.array([tx, ty, tz]),
+                    mode="z",
+                    desc=f"target z={tz:.3f}",
+                )
+            )
+        if not segments:
+            segments.append(
+                PositionSegment(
+                    target=np.array([tx, ty, tz]),
+                    mode="full",
+                    desc="near-height trim",
+                )
+            )
+        return segments
+
     if xy_dist > 0.008:
         segments.append(
             PositionSegment(
@@ -411,6 +512,94 @@ def _segment_command(pos: np.ndarray, segment: PositionSegment) -> np.ndarray:
     return t.copy()
 
 
+def _incremental_position_segment(
+    robot_interface,
+    segment: PositionSegment,
+    *,
+    osc_position_cfg,
+    safety: DemoResetSafetyConfig,
+    label: str = "",
+    accept_tol_m: float | None = None,
+) -> int:
+    """Per-step OSC_POSITION deltas (fallback when batch ``move_to`` stalls)."""
+    trans_scale = float(
+        getattr(osc_position_cfg.action_scale, "translation", None)
+        or osc_position_cfg.get("action_scale", {}).get("translation", 0.05)
+    )
+    grasp = _gripper_action(safety)
+    total_steps = 0
+    accept = accept_tol_m if accept_tol_m is not None else safety.position_tol_m
+
+    for attempt in range(safety.position_max_rounds):
+        pos = _current_ee_pos(robot_interface)
+        err = _segment_error(pos, segment)
+        if err < safety.position_tol_m:
+            print(
+                f"[demo_reset]   {label} ok (incremental) {segment.mode} err={err*100:.2f}cm "
+                f"ee={np.round(pos, 3).tolist()} rounds={attempt}"
+            )
+            return total_steps
+
+        cmd = _segment_command(pos, segment)
+        delta = cmd - pos
+        if segment.mode == "xy":
+            delta[2] = 0.0
+        elif segment.mode == "z":
+            delta[0] = 0.0
+            delta[1] = 0.0
+
+        dist = float(np.linalg.norm(delta))
+        if dist < 1e-5:
+            break
+
+        steps = int(np.clip(dist / trans_scale + 20, 30, safety.position_max_steps))
+        for _ in range(steps):
+            pos = _current_ee_pos(robot_interface)
+            err = _segment_error(pos, segment)
+            if err < safety.position_tol_m:
+                print(
+                    f"[demo_reset]   {label} ok (incremental) {segment.mode} err={err*100:.2f}cm "
+                    f"ee={np.round(pos, 3).tolist()}"
+                )
+                return total_steps
+
+            cmd = _segment_command(pos, segment)
+            delta = cmd - pos
+            if segment.mode == "xy":
+                delta[2] = 0.0
+            elif segment.mode == "z":
+                delta[0] = 0.0
+                delta[1] = 0.0
+            dist = float(np.linalg.norm(delta))
+            if dist < 1e-5:
+                break
+
+            direction = delta / dist
+            step_m = min(dist, trans_scale * 0.95)
+            action = np.zeros(7, dtype=np.float64)
+            action[:3] = direction * (step_m / trans_scale)
+            action[6] = grasp
+            robot_interface.control(
+                controller_type="OSC_POSITION",
+                action=action,
+                controller_cfg=osc_position_cfg,
+            )
+            total_steps += 1
+
+    pos = _current_ee_pos(robot_interface)
+    err = _segment_error(pos, segment)
+    if err <= accept:
+        print(
+            f"[demo_reset]   {label} soft-accept {segment.mode} err={err*100:.2f}cm "
+            f"(accept<={accept*100:.1f}cm) ee={np.round(pos, 3).tolist()}"
+        )
+        return total_steps
+    raise TimeoutError(
+        f"{label} timed out {segment.mode} err={err*100:.2f}cm pos={np.round(pos, 3).tolist()} "
+        f"target={np.round(segment.target.reshape(3), 3).tolist()}"
+    )
+
+
 def _position_segment_until(
     robot_interface,
     segment: PositionSegment,
@@ -418,12 +607,14 @@ def _position_segment_until(
     osc_position_cfg,
     safety: DemoResetSafetyConfig,
     label: str = "",
+    accept_tol_m: float | None = None,
 ) -> int:
     """Axis-decoupled ``position_only_gripper_move_to`` with retry until segment tol."""
     from deoxys.experimental.motion_utils import position_only_gripper_move_to
 
     grasp = safety.gripper_hold_closed
     total_steps = 0
+    accept = accept_tol_m if accept_tol_m is not None else safety.position_tol_m
 
     for attempt in range(safety.position_max_rounds):
         pos = _current_ee_pos(robot_interface)
@@ -438,8 +629,9 @@ def _position_segment_until(
 
         cmd = _segment_command(pos, segment).reshape(3, 1)
         dist = float(np.linalg.norm(cmd.reshape(3) - pos))
+        min_steps = max(30, safety.position_min_steps // 2) if dist < 0.06 else safety.position_min_steps
         num_steps = int(
-            np.clip(dist / 0.0015 + safety.position_min_steps, safety.position_min_steps, safety.position_max_steps)
+            np.clip(dist / 0.0015 + min_steps, min_steps, safety.position_max_steps)
         )
         position_only_gripper_move_to(
             robot_interface,
@@ -452,9 +644,21 @@ def _position_segment_until(
 
     pos = _current_ee_pos(robot_interface)
     err = _segment_error(pos, segment)
-    raise TimeoutError(
-        f"{label} timed out {segment.mode} err={err*100:.2f}cm pos={np.round(pos, 3).tolist()} "
-        f"target={np.round(segment.target.reshape(3), 3).tolist()}"
+    if err <= accept:
+        print(
+            f"[demo_reset]   {label} soft-accept {segment.mode} err={err*100:.2f}cm "
+            f"(accept<={accept*100:.1f}cm) ee={np.round(pos, 3).tolist()}"
+        )
+        return total_steps
+
+    print(f"[demo_reset]   {label} batch stalled err={err*100:.2f}cm — trying incremental")
+    return _incremental_position_segment(
+        robot_interface,
+        segment,
+        osc_position_cfg=osc_position_cfg,
+        safety=safety,
+        label=label,
+        accept_tol_m=accept,
     )
 
 
@@ -507,32 +711,117 @@ def move_to_demo_pose(
     if joint_controller_cfg is None or osc_position_cfg is None:
         raise ValueError("joint_controller_cfg and osc_position_cfg are required for demo reset")
 
+    if getattr(safety, "fast_reset", False):
+        from rlt.hardware.deoxys.fast_reset import FastResetConfig, move_reset_pose_fast
+
+        fast_cfg = FastResetConfig(
+            control_hz=float(control_hz) if control_hz else DEFAULT_CONTROL_HZ,
+            pos_tol_m=pos_tol_m,
+            home_joints=list(safety.home_joints),
+            joint_home_if_delta_above_m=float(safety.home_fallback_delta_m),
+            skip_if_within_m=float(safety.skip_if_within_m),
+        )
+        return move_reset_pose_fast(
+            robot_interface,
+            target,
+            osc_position_cfg=osc_position_cfg,
+            joint_controller_cfg=joint_controller_cfg,
+            reset_cfg=fast_cfg,
+            gripper=gripper,
+            logger=logger,
+        )
+
     total_steps = 0
 
-    if safety.require_home_first:
-        move_home_joints(robot_interface, safety, joint_controller_cfg=joint_controller_cfg)
-
     pos, quat = _current_ee_pose(robot_interface)
+    delta_m = float(np.linalg.norm(pos.reshape(3) - target.ee_pose.reshape(3)))
+
+    if safety.skip_if_within_m > 0 and delta_m <= safety.skip_if_within_m:
+        log(
+            f"[demo_reset] skip motion — already within {delta_m*100:.1f}cm "
+            f"(tol={safety.skip_if_within_m*100:.1f}cm)"
+        )
+        width = float(gripper.position) if gripper is not None else target.gripper_width
+        pos_err, rot_err = pose_errors(pos, quat, target)
+        return {
+            "success": True,
+            "episode_id": target.episode_id,
+            "steps": 0,
+            "motion_skipped": True,
+            "pos_err_m": pos_err,
+            "rot_err_deg": rot_err,
+            "gripper_width": width,
+        }
+
+    need_home = safety.require_home_first
+    if (
+        not need_home
+        and safety.home_fallback_delta_m > 0
+        and delta_m > safety.home_fallback_delta_m
+    ):
+        log(
+            f"[demo_reset] Δ={delta_m*100:.1f}cm > fallback {safety.home_fallback_delta_m*100:.0f}cm "
+            f"— {safety.home_mode} home first"
+        )
+        need_home = True
+
+    if need_home:
+        if safety.home_mode == "hover":
+            total_steps += move_hover_home(
+                robot_interface,
+                target,
+                safety,
+                osc_position_cfg=osc_position_cfg,
+            )
+        else:
+            move_home_joints(robot_interface, safety, joint_controller_cfg=joint_controller_cfg)
+        pos, quat = _current_ee_pose(robot_interface)
+        delta_m = float(np.linalg.norm(pos.reshape(3) - target.ee_pose.reshape(3)))
+
     validate_reset_pose(target, pos, safety)
     log(
         f"[demo_reset] target {target.episode_id} from demo proprio[0] "
         f"xyz={np.round(target.ee_pose, 3).tolist()}"
     )
-    dist_from_home = float(np.linalg.norm(np.asarray(target.ee_pose) - pos))
-    log(f"[demo_reset]   Δ from home ee={dist_from_home*100:.1f}cm (home z≈{pos[2]:.2f} → demo z≈{target.ee_pose[2]:.2f})")
+    log(f"[demo_reset]   Δ ee={delta_m*100:.1f}cm (current z≈{pos[2]:.2f} → demo z≈{target.ee_pose[2]:.2f})")
 
     waypoints = _position_waypoints(pos, target, safety)
     log(f"[demo_reset] phase 1/2: {len(waypoints)} position segments (position_only)")
 
-    for i, segment in enumerate(waypoints):
-        steps = _position_segment_until(
-            robot_interface,
-            segment,
-            osc_position_cfg=osc_position_cfg,
-            safety=safety,
-            label=f"pos{i+1}/{len(waypoints)} {segment.desc}",
-        )
-        total_steps += steps
+    def _run_segments() -> int:
+        steps = 0
+        for i, segment in enumerate(waypoints):
+            steps += _position_segment_until(
+                robot_interface,
+                segment,
+                osc_position_cfg=osc_position_cfg,
+                safety=safety,
+                label=f"pos{i+1}/{len(waypoints)} {segment.desc}",
+                accept_tol_m=pos_tol_m,
+            )
+        return steps
+
+    home_retried = False
+    try:
+        total_steps += _run_segments()
+    except TimeoutError as exc:
+        pos, quat = _current_ee_pose(robot_interface)
+        pos_err, _ = pose_errors(pos, quat, target)
+        if pos_err <= pos_tol_m:
+            log(
+                f"[demo_reset] soft-accept final pos err={pos_err*100:.2f}cm "
+                f"(limit={pos_tol_m*100:.1f}cm) after segment stall"
+            )
+        elif not need_home and not home_retried:
+            log(f"[demo_reset] segment failed ({exc}) — joint home once and retry")
+            move_home_joints(robot_interface, safety, joint_controller_cfg=joint_controller_cfg)
+            pos, quat = _current_ee_pose(robot_interface)
+            waypoints = _position_waypoints(pos, target, safety)
+            log(f"[demo_reset] retry: {len(waypoints)} position segments after home")
+            home_retried = True
+            total_steps += _run_segments()
+        else:
+            raise
 
     log("[demo_reset] phase 2/2: done (xyz only; orientation from teleop/home is kept)")
 
@@ -580,7 +869,14 @@ def _gripper_hold_closed_from_yaml(dc: dict) -> bool:
 
 
 def safety_config_from_yaml(dc: dict) -> DemoResetSafetyConfig:
-    home = list(dc.get("reset_joint_positions") or DEFAULT_RESET_JOINTS)
+    home = list(
+        dc.get("demo_reset_home_joints")
+        or dc.get("reset_joint_positions")
+        or DEFAULT_RESET_JOINTS
+    )
+    home_mode = str(dc.get("demo_reset_home_mode", "joint")).lower()
+    if home_mode not in ("joint", "hover"):
+        raise ValueError(f"demo_reset_home_mode must be joint|hover, got {home_mode!r}")
     return DemoResetSafetyConfig(
         home_joints=home,
         require_home_first=bool(dc.get("demo_reset_require_home_first", True)),
@@ -597,4 +893,9 @@ def safety_config_from_yaml(dc: dict) -> DemoResetSafetyConfig:
         joint_reset_timeout=float(dc.get("demo_reset_joint_timeout", 12.0)),
         post_home_wait_sec=float(dc.get("demo_reset_post_home_wait_sec", 0.4)),
         gripper_hold_closed=_gripper_hold_closed_from_yaml(dc),
+        skip_if_within_m=float(dc.get("demo_reset_skip_if_within_m", 0.0)),
+        home_fallback_delta_m=float(dc.get("demo_reset_home_fallback_delta_m", 0.35)),
+        home_mode=home_mode,
+        direct_move_under_m=float(dc.get("demo_reset_direct_move_under_m", 0.12)),
+        fast_reset=bool(dc.get("demo_reset_fast_reset", dc.get("fast_reset", False))),
     )

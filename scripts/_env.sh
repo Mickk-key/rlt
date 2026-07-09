@@ -6,6 +6,11 @@ SMQ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export SMQ_ROOT
 export RLT_ROOT="${RLT_ROOT:-${SMQ_ROOT}/rlt_project/rlt_reproduce}"
 
+# Robot-side synced modules (actor_loop, gpu_client) override rlt_reproduce copies.
+export SMQ_RLT_SRC="${SMQ_ROOT}/src"
+export RLT_COLLECT_CONFIG="${RLT_COLLECT_CONFIG:-${SMQ_ROOT}/configs/plug_insertion.yaml}"
+export PYTHONPATH="${SMQ_RLT_SRC}:${RLT_ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}"
+
 export DEOXYS_VENDORED="${SMQ_ROOT}/third_party/deoxys"
 export DEOXYS_ROOT="${DEOXYS_ROOT:-${DEOXYS_VENDORED}}"
 if [[ ! -f "${DEOXYS_ROOT}/config/charmander.yml" ]]; then
@@ -18,11 +23,11 @@ export CONDA_ENV="${CONDA_ENV:-franka_mani}"
 export PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION="${PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION:-python}"
 
 export CONTROLLER_TYPE="${CONTROLLER_TYPE:-OSC_POSE}"
+export SMQ_OSC_POSE_CFG="${SMQ_OSC_POSE_CFG:-${SMQ_ROOT}/configs/deoxys/osc-pose-controller.yml}"
+export SMQ_OSC_POSITION_CFG="${SMQ_OSC_POSITION_CFG:-${SMQ_ROOT}/configs/deoxys/osc-position-controller.yml}"
+export SMQ_OSC_CONTROLLER_CFG="${SMQ_OSC_CONTROLLER_CFG:-}"
 export SPACEMOUSE_VENDOR_ID="${SPACEMOUSE_VENDOR_ID:-9583}"
 export SPACEMOUSE_PRODUCT_ID="${SPACEMOUSE_PRODUCT_ID:-50746}"
-
-export RLT_COLLECT_CONFIG="${RLT_COLLECT_CONFIG:-${RLT_ROOT}/configs/plug_insertion.yaml}"
-export PYTHONPATH="${RLT_ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}"
 
 # All runtime outputs stay under SMQ&JGY (never /tmp)
 export SMQ_DATA_DIR="${SMQ_DATA_DIR:-${SMQ_ROOT}/data}"

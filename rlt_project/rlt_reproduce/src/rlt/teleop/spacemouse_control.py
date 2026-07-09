@@ -76,3 +76,13 @@ def apply_gripper_latch(
 
 def is_spacemouse_reset(action) -> bool:
     return action is None
+
+
+def acknowledge_spacemouse_reset(device) -> None:
+    """After handling SpaceMouse RIGHT in our code, re-enable teleop.
+
+    deoxys sets ``_reset_state=1`` and ``_enabled=False`` on button 2; if we do not
+    clear these, every subsequent ``input2action`` returns ``None`` and motion stops.
+    """
+    device._reset_state = 0
+    device._enabled = True

@@ -5,6 +5,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/_env.sh
 source "$SCRIPT_DIR/_env.sh"
 
+CONFIG="${1:-$RLT_COLLECT_CONFIG}"
+
 echo "==> RealSense USB enumeration"
 if command -v rs-enumerate-devices >/dev/null 2>&1; then
   rs-enumerate-devices 2>/dev/null | awk '
@@ -17,7 +19,7 @@ else
 fi
 
 echo ""
-echo "==> pyrealsense2 discovery"
+echo "==> pyrealsense2 discovery (USB order — may NOT match wrist/external roles)"
 activate_robot_env
 python - <<'PY'
 import sys
@@ -39,30 +41,30 @@ except Exception as exc:
 PY
 
 echo ""
+echo "==> Config mapping (source of truth: ${CONFIG})"
+activate_robot_env
+python - <<PY
+import json, yaml
+from pathlib import Path
+
+config = Path("${CONFIG}")
+with open(config) as f:
+    mapping = yaml.safe_load(f).get("cameras", {}).get("mapping", {})
+if mapping:
+    for name, sn in mapping.items():
+        print(f"  {name}: {sn}")
+    print(f"\n  Test: bash scripts/test_camera.sh")
+    out = __import__("os").environ.get("SMQ_CAMERA_TEST_DIR", "data/camera_test")
+    print(f"  Verify: {out}/wrist.png = wrist mount view")
+    print(f"          {out}/external.png = fixed external view")
+else:
+    print("  [WARN] cameras.mapping empty")
+PY
+
+echo ""
 echo "==> Stuck camera processes (cause 'Device or resource busy')"
 pgrep -af "test_camera|RealSenseCamera|realsense_camera" 2>/dev/null || echo "  none"
 
 echo ""
 echo "==> USB RealSense devices"
 lsusb 2>/dev/null | grep -i 8086 || echo "  none (check cable / USB3 port)"
-
-echo ""
-echo "==> Suggested test command"
-activate_robot_env
-python - <<'PY'
-import sys
-from pathlib import Path
-root = Path("/home/host5010/workspaces/wty/deoxys_control/deoxys")
-sys.path.insert(0, str(root))
-from deoxys.camera import RealSenseCameraManager
-serials = RealSenseCameraManager.discover_cameras()
-if not serials:
-    print("  (no cameras — plug into USB3, then re-run)")
-else:
-    names = ["wrist", "external", "third"]
-    mapping = {names[i]: s for i, s in enumerate(serials[:3])}
-    import json
-    print(f"  CAMERA_MAPPING='{json.dumps(mapping)}' bash scripts/test_camera.sh")
-    if len(serials) < 2:
-        print("  [WARN] Only 1 camera — plug 2nd into USB3 (not USB2 hub) and re-run")
-PY
