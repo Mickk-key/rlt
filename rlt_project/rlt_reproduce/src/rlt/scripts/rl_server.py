@@ -127,10 +127,20 @@ class RLServer:
         self._critic_updates = rl["critic_updates_per_actor"]
 
         infer_cfg = raw.get("inference", {})
-        self.inference_mode = infer_cfg.get("mode", "reference")
+        # "auto" = paper-faithful warmup-gated execution (Algorithm 1 line 9).
+        # "reference" / "reference_noise" / "policy" = manual debug overrides.
+        self.inference_mode = infer_cfg.get("mode", "auto")
+        self._manual_override = None if self.inference_mode == "auto" else self.inference_mode
+        self._policy_ramp_steps = int(infer_cfg.get("ramp_steps", 0))
+        anchor_cfg = raw.get("policy_anchor", {})
         self.inference_policy = RLTInferencePolicy(
             self.learner,
             noise_std=float(infer_cfg.get("reference_noise_std", rl.get("action_noise_std", 0.05))),
+            anchor_enabled=bool(anchor_cfg.get("enabled", True)),
+            max_dev_trans_m=float(anchor_cfg.get("max_dev_trans_m", 0.01)),
+            max_dev_rot_rad=float(anchor_cfg.get("max_dev_rot_rad", 0.05)),
+            max_dev_grip=float(anchor_cfg.get("max_dev_grip", 1.0)),
+            action_dim=action_dim,
         )
         self._image_size = tuple(raw.get("cameras", {}).get("image_size", [224, 224]))
         logger.info("Inference mode: %s", self.inference_mode)
@@ -203,23 +213,21 @@ class RLServer:
         return s
 
     def _as_action_chunk(self, arr: Any, *, label: str) -> np.ndarray:
-        """Expand per-step robot action (7,) to learner chunk (chunk_length, action_dim)."""
+        """Validate a REAL action chunk of shape ``(chunk_length, action_dim)``.
+
+        Phase 4: single-step tiling (``np.tile(a, (C, 1))``) is removed — the robot
+        must send genuine executed/reference chunks so the critic sees ``a_{t:t+C}``
+        and the temporal gap matches ``gamma^C``. Only genuine (C, action_dim)
+        arrays are accepted; anything else is a bug and must fail loudly.
+        """
         a = np.asarray(arr, dtype=np.float32)
         cl, ad = self.chunk_length, self._action_dim
-        if a.ndim == 1:
-            if a.shape[0] != ad:
-                raise ValueError(f"{label} dim {a.shape[0]} != action_dim {ad}")
-            return np.tile(a, (cl, 1))
-        if a.ndim == 2 and a.shape[1] == ad:
-            if a.shape[0] == cl:
-                return a
-            if a.shape[0] == 1:
-                return np.tile(a, (cl, 1))
-            if a.shape[0] < cl:
-                pad = np.repeat(a[-1:], cl - a.shape[0], axis=0)
-                return np.concatenate([a, pad], axis=0)
-            return a[:cl]
-        raise ValueError(f"{label} shape {a.shape} invalid; want ({ad},) or ({cl}, {ad})")
+        if a.shape == (cl, ad):
+            return a
+        raise ValueError(
+            f"{label} shape {a.shape} != required real chunk ({cl}, {ad}); "
+            f"single-step tiling is not allowed (Phase 4)"
+        )
 
     def _vla_inputs(self, msg: dict[str, Any]) -> tuple[np.ndarray, dict[str, np.ndarray] | None]:
         proprio = np.asarray(msg["proprio"], dtype=np.float32)
@@ -266,10 +274,27 @@ class RLServer:
         vla_sec = time.perf_counter() - t0
         ref = vla_out.reference_action[: self.chunk_length]
         state = self._state_from_vla_output(vla_out, proprio)
-        action_np, meta = self.inference_policy.act(
+        action_np, meta = self.inference_policy.act_gated(
             state,
             ref,
-            mode=self.inference_mode,
+            buffer_size=len(self.buffer),
+            warmup_steps=self._warmup,
+            ramp_steps=self._policy_ramp_steps,
+            override=self._manual_override,
+        )
+        logger.info(
+            "[exec] mode=%s override=%s buffer=%d/%d ramp=%d alpha=%.3f "
+            "ref_norm=%.4f policy_norm=%s executed_norm=%.4f anchor_clipped=%s",
+            meta.get("exec_mode"),
+            self._manual_override,
+            len(self.buffer),
+            self._warmup,
+            self._policy_ramp_steps,
+            float(meta.get("alpha", 0.0)),
+            float(meta.get("ref_norm", 0.0)),
+            f"{meta['policy_norm']:.4f}" if "policy_norm" in meta else "n/a",
+            float(meta.get("executed_norm", 0.0)),
+            meta.get("anchor_clipped", "n/a"),
         )
         total_sec = time.perf_counter() - t0
         if vla_sec > 5.0 or total_sec > 5.0:
@@ -304,19 +329,46 @@ class RLServer:
             )
         return self._encode_state(next_proprio, images)
 
+    def _aggregate_chunk_reward(self, msg: dict[str, Any]) -> float:
+        """In-chunk discounted return R = sum_{k=0}^{C-1} gamma^k r_{t+k} (Eq. 3).
+
+        Robot sends per-step ``rewards`` for the chunk; discounting uses the learner's
+        gamma so the exponent convention stays in one place. A pre-aggregated scalar
+        ``reward`` is accepted as a fallback (legacy / single-env path).
+        """
+        if "rewards" in msg:
+            r = np.asarray(msg["rewards"], dtype=np.float32).reshape(-1)
+            k = np.arange(r.shape[0], dtype=np.float32)
+            return float(np.sum((self.learner.discount**k) * r))
+        return float(msg["reward"])
+
+    def handle_encode(self, msg: dict[str, Any]) -> dict[str, Any]:
+        """Encode an observation into the RL state x = [z_rl | proprio].
+
+        Used by the robot to build the per-step state stream (x_0..x_T) so it can
+        assemble paper-faithful chunk transitions with the correct C-step gap.
+        """
+        proprio, images = self._vla_inputs(msg)
+        state = self._encode_state(proprio, images)
+        return {"type": "encode_response", "state": state.tolist()}
+
     def handle_transition(self, msg: dict[str, Any]) -> dict[str, Any]:
         state = self._as_state_vector(msg["state"], label="state")
         next_state = self._as_state_vector(self._resolve_next_state(msg), label="next_state")
         action = self._as_action_chunk(msg["action"], label="action")
         reference = self._as_action_chunk(msg["reference_action"], label="reference_action")
+        next_ref_raw = msg.get("next_reference_action", msg["reference_action"])
+        next_reference = self._as_action_chunk(next_ref_raw, label="next_reference_action")
+        reward = self._aggregate_chunk_reward(msg)
         self.buffer.add(
             Transition(
                 state=state,
                 action=action,
                 reference_action=reference,
-                reward=float(msg["reward"]),
+                reward=reward,
                 next_state=next_state,
                 done=bool(msg["done"]),
+                next_reference_action=next_reference,
             )
         )
         updated = False
@@ -344,17 +396,30 @@ class RLServer:
             msg = json.loads(raw_msg)
             msg_type = msg.get("type")
             if msg_type == "ping":
+                buf = len(self.buffer)
+                if self._manual_override is not None:
+                    exec_state = f"override:{self._manual_override}"
+                elif buf < self._warmup:
+                    exec_state = "warmup_reference"
+                elif self._policy_ramp_steps > 0 and buf < self._warmup + self._policy_ramp_steps:
+                    exec_state = "ramp"
+                else:
+                    exec_state = "policy"
                 resp = {
                     "type": "pong",
-                    "buffer_size": len(self.buffer),
+                    "buffer_size": buf,
                     "device": self.device,
                     "warmup_steps": self._warmup,
-                    "training": len(self.buffer) >= self._warmup,
+                    "ramp_steps": self._policy_ramp_steps,
+                    "training": buf >= self._warmup,
                     "train_steps": self._train_steps,
                     "inference_mode": self.inference_mode,
+                    "exec_state": exec_state,
                 }
             elif msg_type == "infer":
                 resp = self.handle_infer(msg)
+            elif msg_type == "encode":
+                resp = self.handle_encode(msg)
             elif msg_type == "transition":
                 resp = self.handle_transition(msg)
             else:

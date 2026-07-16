@@ -52,8 +52,27 @@ online_rl:
   checkpoint_save_on_shutdown: true
 
 inference:
+  # FIRST FRESH RUN: forced "reference" (execution stays VLA reference regardless of
+  # buffer). After data-QA (>=500 valid chunk transitions AND >=2-3 successful reference
+  # episodes AND verified shapes/rewards/done) switch to "auto" and RESTART rl_server.
+  # NOTE: rl_server actually loads the tree-B config
+  # (rlt_project/rlt_reproduce/configs/plug_insertion_gpu.yaml) via run_rl_server.sh;
+  # this mirror is kept in parity to avoid drift.
+  #
+  # "auto" = warmup-gated: buffer<warmup -> reference; warmup..warmup+ramp -> ramp;
+  #          >= warmup+ramp -> anchored policy.
   mode: reference
+  ramp_steps: 500          # replay transitions over which alpha goes 0 -> 1 (0 = hard switch)
   reference_noise_std: 0.05
+
+# Paper-faithful deployment anchor (rl/inference_policy.py): actor outputs an ABSOLUTE
+# chunk a~pi(a|x,ref); at deployment the deviation is bounded to a local edit of the
+# VLA reference: action = reference + clip(actor - reference, +/- delta).
+policy_anchor:
+  enabled: true
+  max_dev_trans_m: 0.01    # max per-step translation deviation from VLA reference (m)
+  max_dev_rot_rad: 0.05    # max per-step axis-angle rotation deviation (rad)
+  max_dev_grip: 1.0
 
 paths:
   checkpoint_dir: checkpoints

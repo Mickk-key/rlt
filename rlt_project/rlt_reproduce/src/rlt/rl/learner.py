@@ -61,10 +61,18 @@ class RLTLearner:
         return torch.as_tensor(arr, dtype=torch.float32, device=self.device)
 
     def _batchify(self, batch: list[Transition]) -> dict[str, torch.Tensor]:
+        # ``next_reference`` = VLA reference at the *next* state (ref'), needed for the
+        # paper target a' ~ pi(x', ref'). Legacy single-env transitions omit it, so we
+        # fall back to the current reference for backward compatibility.
+        next_ref = [
+            t.next_reference_action if t.next_reference_action is not None else t.reference_action
+            for t in batch
+        ]
         return {
             "state": self._to_tensor(np.stack([t.state for t in batch])),
             "action": self._to_tensor(np.stack([t.action for t in batch])),
             "reference": self._to_tensor(np.stack([t.reference_action for t in batch])),
+            "next_reference": self._to_tensor(np.stack(next_ref)),
             "reward": self._to_tensor(np.array([t.reward for t in batch])),
             "next_state": self._to_tensor(np.stack([t.next_state for t in batch])),
             "done": self._to_tensor(np.array([float(t.done) for t in batch])),
@@ -73,8 +81,12 @@ class RLTLearner:
     def update_critic(self, batch: list[Transition]) -> float:
         data = self._batchify(batch)
         with torch.no_grad():
-            next_action, _ = self.actor_target.sample(data["next_state"], data["reference"])
+            # a' ~ pi(x', ref') — condition the next action on the NEXT state's reference.
+            next_action, _ = self.actor_target.sample(data["next_state"], data["next_reference"])
             target_q = self.critic_target.min_q(data["next_state"], next_action)
+            # Temporal gap of every stored transition is exactly ``chunk_length`` env steps
+            # (next_state = x_{t+C}), so the bootstrap discount is gamma^C — matching the
+            # in-chunk return R = sum_{k=0}^{C-1} gamma^k r_{t+k} already stored in reward.
             gamma_c = self.discount ** self.chunk_length
             q_target = data["reward"] + (1.0 - data["done"]) * gamma_c * target_q
 

@@ -5,6 +5,15 @@ Each step: get obs → send to GPU → receive action → execute on Franka → 
 Reward and episode termination come from RewardLogger (s/f keys or timeout).
 Reset is handled by ResetManager before each episode (not part of RL step).
 
+RUNTIME AUTHORITATIVE COPY: this file lives in ``smq&jgy/src`` and is placed FIRST on
+the robot ``PYTHONPATH`` by ``smq&jgy/scripts/_env.sh``, so it overrides the
+``rlt_project/rlt_reproduce/src`` copy at runtime. The Phase 4 transition logic
+(``build_chunk_transitions`` / ``run_episode`` / ``_validate_chunk_transition``) is
+kept byte-identical with the rlt_reproduce copy; only the robot-specific reset/camera
+bootstrap and ``Path(__file__).parents[N]`` depths in ``main()`` differ (they must, the
+two files sit at different directory depths). When editing the transition logic, apply
+the SAME change to both copies.
+
 Usage:
   MOCK=1 python -m rlt.scripts.actor_loop --mock          # no robot, no GPU
   python -m rlt.scripts.actor_loop --config configs/plug_insertion.yaml
@@ -38,7 +47,7 @@ from rlt.hardware.deoxys.reset_manager import ResetManager
 from rlt.hardware.gripper_factory import create_robot_env
 from rlt.rl.gpu_client import GPUClient, MockGPUClient, create_gpu_client
 from rlt.rl.reward_logger import EpisodeOutcome, RewardLogger
-from rlt.rl.ws_protocol import ensure_observation_images_jpeg, pack_observation
+from rlt.rl.ws_protocol import ensure_observation_images_jpeg
 from rlt.sim.mock_env import MockPrecisionEnv
 from rlt.util.deoxys_paths import apply_deoxys_paths
 from rlt.util.terminal_keys import stdin_is_tty, terminal_keys
@@ -173,6 +182,109 @@ def _write_transition_log(log_dir: Path, episode_id: str, records: list[StepReco
     return path
 
 
+def build_chunk_transitions(
+    states: list[np.ndarray],
+    actions: list[np.ndarray],
+    references: list[np.ndarray],
+    rewards: list[float],
+    *,
+    chunk_length: int,
+    stride: int,
+    terminated: bool,
+) -> list[dict[str, Any]]:
+    """Assemble paper-faithful chunk transitions from an episode's per-step stream.
+
+    Inputs are the continuous per-step episode stream:
+      ``states``     = x_0 .. x_T           (len T+1, encoded RL states)
+      ``actions``    = a_0 .. a_{T-1}        (executed actions, len T)
+      ``references`` = ref_0 .. ref_{T-1}    (aligned VLA references, len T)
+      ``rewards``    = r_0 .. r_{T-1}        (per-step rewards, len T)
+
+    Emits, for each subsampled start ``s`` (stride, RLT App. B uses stride 2) with a
+    full window ``s+C <= T``, the transition
+
+        (x_s, a_{s:s+C}, ref_{s:s+C}, ref_{s+C:s+2C}, r_{s:s+C}, x_{s+C}, done)
+
+    i.e. a REAL executed action chunk (no tiling), the aligned reference chunk, the
+    NEXT-state reference chunk (for the critic target a'~pi(x',ref')), the per-step
+    rewards (server discounts them into R = sum gamma^k r), and the state exactly C
+    env-steps later. When the episode terminates, the terminal chunk (carrying the
+    sparse success reward and ``done=True``) is always emitted, padded to length C if
+    the episode ended in fewer than C steps.
+    """
+    C = int(chunk_length)
+    stride = max(1, int(stride))
+    T = len(actions)
+    if not (len(states) == T + 1 and len(references) == T and len(rewards) == T):
+        raise ValueError(
+            f"stream length mismatch: states={len(states)} actions={T} "
+            f"references={len(references)} rewards={len(rewards)} (need states == actions + 1)"
+        )
+    if T == 0:
+        return []
+
+    zero = np.zeros_like(np.asarray(references[0], dtype=np.float32))
+
+    def chunk(seq: list[np.ndarray], start: int) -> np.ndarray:
+        out = [np.asarray(x, dtype=np.float32) for x in seq[start : start + C]]
+        if not out:
+            out = [zero.copy()]
+        while len(out) < C:
+            out.append(out[-1].copy())
+        return np.stack(out[:C]).astype(np.float32)
+
+    def reward_chunk(start: int) -> list[float]:
+        out = [float(r) for r in rewards[start : start + C]]
+        while len(out) < C:
+            out.append(0.0)
+        return out[:C]
+
+    transitions: list[dict[str, Any]] = []
+    emitted: set[int] = set()
+
+    def emit(s: int, *, done: bool) -> None:
+        e = s + C
+        transitions.append(
+            {
+                "state": np.asarray(states[s], dtype=np.float32),
+                "action": chunk(actions, s),
+                "reference_action": chunk(references, s),
+                "next_reference_action": chunk(references, e),
+                "rewards": reward_chunk(s),
+                "next_state": np.asarray(states[min(e, T)], dtype=np.float32),
+                "done": bool(done),
+                "_t_start": int(s),
+                "_t_next": int(min(e, T)),
+                "_n_real_steps": int(min(e, T) - s),
+            }
+        )
+        emitted.add(s)
+
+    for s in range(0, max(0, T - C + 1), stride):
+        emit(s, done=bool(terminated and s + C == T))
+
+    if terminated:
+        s_term = max(0, T - C)
+        if s_term not in emitted:
+            emit(s_term, done=True)
+
+    return transitions
+
+
+def _validate_chunk_transition(tr: dict[str, Any], *, chunk_length: int, action_dim: int) -> None:
+    """Fail loudly on any malformed chunk transition (Phase 4 debug validation)."""
+    C, ad = int(chunk_length), int(action_dim)
+    for key in ("action", "reference_action", "next_reference_action"):
+        arr = np.asarray(tr[key], dtype=np.float32)
+        if arr.shape != (C, ad):
+            raise ValueError(f"transition {key} shape {arr.shape} != required ({C}, {ad})")
+    if len(tr["rewards"]) != C:
+        raise ValueError(f"transition rewards len {len(tr['rewards'])} != C={C}")
+    gap = int(tr["_t_next"]) - int(tr["_t_start"])
+    if not (gap == C or tr["done"]):
+        raise ValueError(f"non-terminal transition temporal gap {gap} != C={C}")
+
+
 def run_episode(
     env,
     gpu: GPUClient,
@@ -186,10 +298,20 @@ def run_episode(
     camera_mapping: dict[str, str],
     log_dir: Path | None,
     episode_index: int,
+    action_dim: int = 7,
+    subsample_stride: int = 2,
     image_size: tuple[int, int] | None = None,
     frame_cache: dict[str, np.ndarray] | None = None,
 ) -> EpisodeOutcome:
-    """One critical-phase episode: infer chunks, execute, poll reward until done."""
+    """One critical-phase episode: infer chunks, execute, build chunk transitions.
+
+    Phase 4: instead of shipping one malformed single-step transition per env step
+    (later tiled into a fake chunk on the GPU), the robot records the continuous
+    per-step episode stream (states x_0..x_T via infer + per-step ``encode``, executed
+    actions, aligned references, rewards) and, at episode end, assembles REAL chunk
+    transitions ``(x_s, a_{s:s+C}, ref_{s:s+C}, R, x_{s+C})`` with a genuine C-step
+    gap (see :func:`build_chunk_transitions`).
+    """
     dt = 1.0 / control_hz
     proprio = env.get_proprio() if hasattr(env, "get_proprio") else env.reset()
     step = 0
@@ -197,7 +319,15 @@ def run_episode(
     records: list[StepRecord] = []
     episode_id = f"ep_{episode_index:04d}"
 
-    while True:
+    # Continuous per-step episode stream used to assemble paper-faithful chunks.
+    stream_states: list[np.ndarray] = []  # x_0 .. x_T
+    stream_actions: list[np.ndarray] = []  # a_0 .. a_{T-1}
+    stream_refs: list[np.ndarray] = []  # ref_0 .. ref_{T-1}
+    stream_rewards: list[float] = []  # r_0 .. r_{T-1}
+    terminated = False
+    outcome: EpisodeOutcome | None = None
+
+    while not terminated:
         obs = _build_observation(
             proprio,
             camera_manager,
@@ -229,7 +359,9 @@ def run_episode(
         result = gpu.infer(obs)
         if result.state is None:
             raise RuntimeError("GPU infer missing encoded state — restart GPU rl_server with latest code")
-        current_state = np.asarray(result.state, dtype=np.float32)
+        # State at the current planning boundary (recomputed each infer; identical to
+        # the last per-step encode, so no double counting in the stream).
+        cur_state = np.asarray(result.state, dtype=np.float32)
         action_chunk = result.action_chunk
         ref_chunk = result.reference_action
         policy_mode = (result.meta or {}).get("policy_mode", "reference")
@@ -246,6 +378,12 @@ def run_episode(
             action = exec_chunk[i].astype(np.float32)
             ref_step = ref_chunk[i].astype(np.float32)
             ee_before = proprio[:3].copy()
+
+            # Record the pre-step state x_step and the executed/reference action.
+            stream_states.append(cur_state)
+            stream_actions.append(action)
+            stream_refs.append(ref_step)
+
             next_proprio, _, _, _ = env.step(action)
             step += 1
             if step <= 5:
@@ -259,6 +397,7 @@ def run_episode(
             step_reward = float(outcome.reward) if outcome else 0.0
             step_done = bool(outcome.done) if outcome else False
             total_reward += step_reward
+            stream_rewards.append(step_reward)
 
             records.append(
                 StepRecord(
@@ -270,6 +409,8 @@ def run_episode(
                 )
             )
 
+            # Encode the resulting state x_{step+1} so the stream carries a genuine
+            # per-step next_state (never a 1-step gap tiled to look like a chunk).
             next_obs = _build_observation(
                 next_proprio,
                 camera_manager,
@@ -277,61 +418,57 @@ def run_episode(
                 language,
                 frame_cache=frame_cache,
             )
-            trans: dict[str, Any] = {
-                "state": current_state.tolist(),
-                "action": action.tolist(),
-                "reference_action": ref_step.tolist(),
-                "reward": step_reward,
-                "done": step_done,
-                "next_proprio": next_proprio.astype(np.float32).tolist(),
-                "language": language,
-            }
-            if next_obs.get("images"):
-                packed = pack_observation(
-                    next_proprio.astype(np.float32),
-                    images=next_obs["images"],
-                    language=language,
-                )
-                if "images_jpeg" in packed:
-                    trans["next_images_jpeg"] = packed["images_jpeg"]
-
-            t_resp = gpu.send_transition(trans)
-            current_state = np.asarray(t_resp["next_state"], dtype=np.float32)
-            if t_resp.get("updated") and t_resp.get("metrics"):
-                console.print(
-                    f"[dim]learner[/dim] buffer={t_resp.get('buffer_size')} "
-                    f"metrics={t_resp.get('metrics')}"
-                )
-
+            cur_state = np.asarray(gpu.encode(next_obs), dtype=np.float32)
             proprio = next_proprio
+
             if outcome:
-                if log_dir:
-                    _write_transition_log(log_dir, episode_id, records)
-                    reward_logger.log_episode(
-                        outcome,
-                        episode_id=episode_id,
-                        steps=step,
-                        total_reward=total_reward,
-                    )
-                console.print(
-                    f"[green]Episode {episode_id} done[/green] "
-                    f"reason={outcome.reason} reward={outcome.reward} steps={step}"
-                )
-                return outcome
+                terminated = True
+                stream_states.append(cur_state)  # terminal state x_T
+                break
 
             time.sleep(dt)
 
-        outcome = reward_logger.poll(step)
-        if outcome:
-            if log_dir:
-                _write_transition_log(log_dir, episode_id, records)
-                reward_logger.log_episode(
-                    outcome,
-                    episode_id=episode_id,
-                    steps=step,
-                    total_reward=total_reward,
-                )
-            return outcome
+    # --- Episode finished: assemble + ship REAL chunk transitions -----------------
+    transitions = build_chunk_transitions(
+        stream_states,
+        stream_actions,
+        stream_refs,
+        stream_rewards,
+        chunk_length=chunk_length,
+        stride=subsample_stride,
+        terminated=terminated,
+    )
+    last_resp: dict[str, Any] = {}
+    for tr in transitions:
+        _validate_chunk_transition(tr, chunk_length=chunk_length, action_dim=action_dim)
+        payload = {k: v for k, v in tr.items() if not k.startswith("_")}
+        last_resp = gpu.send_transition(payload)
+        if last_resp.get("updated") and last_resp.get("metrics"):
+            console.print(
+                f"[dim]learner[/dim] buffer={last_resp.get('buffer_size')} "
+                f"metrics={last_resp.get('metrics')}"
+            )
+    console.print(
+        f"[dim]sent {len(transitions)} chunk transitions[/dim] "
+        f"stride={subsample_stride} C={chunk_length} steps={step} "
+        f"buffer≈{last_resp.get('buffer_size', 'n/a')}"
+    )
+
+    if outcome is not None:
+        if log_dir:
+            _write_transition_log(log_dir, episode_id, records)
+            reward_logger.log_episode(
+                outcome,
+                episode_id=episode_id,
+                steps=step,
+                total_reward=total_reward,
+            )
+        console.print(
+            f"[green]Episode {episode_id} done[/green] "
+            f"reason={outcome.reason} reward={outcome.reward} steps={step}"
+        )
+        return outcome
+    raise RuntimeError("episode ended without an outcome")
 
 
 def main() -> None:
@@ -354,6 +491,8 @@ def main() -> None:
     vla = raw.get("vla", {})
     paths = raw.get("paths", {})
     chunk_length = rl.get("chunk_length", 10)
+    action_dim = rl.get("action_dim", 7)
+    subsample_stride = int(rl.get("subsample_stride", 2))
     execute_prefix = vla.get("execute_prefix", 20)
     control_hz = rl.get("control_hz", raw.get("robot", {}).get("control_hz", 20))
     max_steps = args.max_steps or int(os.environ.get("MAX_STEPS", rl.get("max_steps_per_episode", 200)))
@@ -562,6 +701,8 @@ def main() -> None:
                     camera_mapping=camera_mapping,
                     log_dir=log_dir,
                     episode_index=ep,
+                    action_dim=action_dim,
+                    subsample_stride=subsample_stride,
                     image_size=image_size,
                     frame_cache=camera_frame_cache,
                 )
