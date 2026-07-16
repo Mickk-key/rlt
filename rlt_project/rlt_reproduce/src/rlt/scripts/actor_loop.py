@@ -405,11 +405,12 @@ def main() -> None:
     )
 
     key_ctx = nullcontext() if (env_mock or not stdin_is_tty()) else terminal_keys()
+    prev_success = False
     try:
         with key_ctx:
             for ep in range(episodes):
                 if reset_manager is not None:
-                    proprio, reset_info = reset_manager.reset()
+                    proprio, reset_info = reset_manager.reset(prev_success=prev_success)
                     console.print(f"Reset ep {ep}: {reset_info}")
                 elif hasattr(env, "reset"):
                     env.reset()
@@ -422,7 +423,7 @@ def main() -> None:
                         timeout_sec=5.0,
                     )
 
-                run_episode(
+                outcome = run_episode(
                     env,
                     gpu,
                     reward_logger,
@@ -437,6 +438,7 @@ def main() -> None:
                     image_size=image_size,
                     frame_cache=camera_frame_cache,
                 )
+                prev_success = bool(outcome is not None and outcome.reason == "success_key")
     finally:
         if camera_manager is not None:
             camera_manager.stop()

@@ -41,6 +41,10 @@ online_rl:
   reset_config: configs/sft_plug_insertion.yaml
   # external = subprocess reset_to_init.sh (release ZMQ, dedicated reset client)
   reset_method: external
+  # After a success (s key), raise EE straight up this many meters (xy locked)
+  # before归位 so the still-gripped plug leaves the socket vertically instead of
+  # being dragged sideways by the xy-first reset. Set 0 to disable.
+  success_lift_z_m: 0.06
   post_reset_wait_sec: 0.5
   # Match SFT: let OSC settle + drain stale RealSense frames before first VLA infer.
   post_reset_settle_sec: 1.0
