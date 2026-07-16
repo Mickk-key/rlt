@@ -8,6 +8,217 @@
 
 ---
 
+## 更新 — 2026-07-16 RLT 对齐修复（Phase 1–4 + 安全）
+
+> **权威说明见** [`docs/desktop/online_rl_worklog.md` §0](../../../docs/desktop/online_rl_worklog.md)。下文 §5「代码与配置风险审查」多为 7/5 旧状态，其中若干已在 7/16 修复：
+>
+> - **运行时源码树映射**：`actor_loop.py` / `gpu_client.py` 运行时用 **Tree C**（`smq&jgy/src`，`_env.sh` 置于 PYTHONPATH 最前）；`rl_server.py`、`learner.py`、`replay_buffer.py`、`inference_policy.py`、`deoxys_env.py` 用 **Tree B**（`rlt_reproduce/src`）。两树同属一个 git 仓库；`actor_loop`/`gpu_client` 两份功能代码保持同步。
+> - **Phase 1 安全 clamp**（`deoxys_env.py`）：物理 EE 增量硬限幅（平移 ≤0.02m、旋转 ≤0.1rad、夹爪 clip、NaN→保持位姿），reference/policy 均生效。
+> - **Phase 2 policy 锚定**（`inference_policy.py`）：`action = reference + clip(actor-reference, ±delta)`（0.01m/0.05rad），actor 架构不变、非 residual。
+> - **Phase 3 warmup/ramp 门控**（`act_gated`）：按 buffer transition 数决定 reference→ramp→policy；`warmup_steps=500`、`ramp_steps=500`。
+> - **Phase 4 真实 chunk transition**：`(x_s, a_{s:s+C}, ref_{s:s+C}, ref_{s+C:s+2C}, R=Σγ^k r, x_{s+C}, done)`，无 tile；`γ^C` 与 C 步间隔一致；终局 padding：动作/reference 补最后有效步、reward 补 0。**这修复了下文 §5.3(5) 的「单步 tile 成 chunk」。**
+> - **checkpoint**：保留 `rl_token.pt` + SFT VLA（`pi05_base` / `pi05_plug_insertion`）；丢弃 `rl_actor.pt` / `rl_critic.pt` / `online_rl/`（删除前已备份到 `checkpoints/backups/phase5_pre_reset_*`）。
+> - **安全重启**：首跑强制 `inference.mode: reference`，待 ≥500 有效 transition + 形状/reward/done 校验 + 2–3 成功 reference episode 后改回 `auto` 并重启 server。
+
+---
+
+## 速查 — 核心概念、算法问题与对策（2026-07-10）
+
+> 本节为组内 FAQ：汇总 **Online RL / Reference / Policy** 概念，以及 **算法问题分析、优化方向、解决方法**。下文原有章节（进度、SFT 切换、启动流程等）保持不变。
+
+### A. 核心概念（Online RL / Reference / Policy）
+
+#### A.1 四个阶段别混
+
+| 层级 | 含义 | 当前（7/10） |
+|------|------|--------------|
+| 双机通路 | WebSocket infer / transition 通 | ✅ |
+| **Reference rollout** | 真臂 + SFT VLA；臂执行 **reference** | 🟡 ~20+ ep，success 低 |
+| **Stage-3 训练** | buffer ≥ warmup 后 TD3 更新 | 🟡 buffer 578，train 395 |
+| **Policy 控臂（Stage-4）** | `mode: policy`，**RL Actor** 出动作 | ⬜ 未开始 |
+
+- **Online RL「训练开始」** = replay 满 warmup + GPU 出现 `learner metrics`（**不必等 policy**）。
+- **Policy 阶段** = 改 GPU yaml `inference.mode: policy` 并重启 server。
+
+#### A.2 Rollout / Reference / Policy
+
+| 词 | 一句话 |
+|----|--------|
+| **Rollout** | 真机跑完一整局 episode（reset → 多步 → s/f/timeout） |
+| **Reference** | SFT VLA 输出的动作；`inference.mode: reference` 时 **臂听 VLA** |
+| **Policy 控臂** | RL Actor 输出动作；VLA 仍提供 reference 作条件，但 **臂听 Actor** |
+| **Buffer** | GPU 上存 transition 的经验池（`buffer_size` = 条数，不是 episode 数） |
+| **TD3** | 从 buffer 抽样更新 Actor/Critic 的算法（`RLTLearner`） |
+| **Transition** | 一步经验，见 A.3 |
+
+#### A.3 Transition 记什么？
+
+| 字段 | 含义 |
+|------|------|
+| `state` | 当前 `[z_rl, proprio]`（GPU 算） |
+| `action` | **本步实际执行**的 7 维动作 |
+| `reference_action` | 本步 VLA reference |
+| `reward` | 通常仅按 **s/f** 那步为 1/0，中间步为 0 |
+| `next_state` | **下一步状态向量**（非「下一步动作」） |
+| `done` | 本步后 episode 是否结束 |
+
+**「动作为下一步 infer 时另算」**：chunk 内逐步执行；chunk 用完或需新动作时，**下一次 `gpu.infer()`** 用 **新相机图 + proprio** 再算，不在 `next_state` 里。
+
+Reference 模式下 action 来自 **VLA infer**，不是工控机本地 `f(state)`。
+
+#### A.4 「收敛」分别指什么？
+
+| 对象 | Reference 阶段 | Policy 阶段 |
+|------|----------------|-------------|
+| SFT VLA 权重 | ❌ 冻结，不收敛 | ❌ 不变 |
+| Reset/接近进工作区（Jerry：~100%） | ✅ 应稳定 | 仍应稳定 |
+| 终局插入 success（按 s） | ❌ 不要求收敛到 100% | ✅ **行为应变好并稳定** |
+| TD3 / buffer | ✅ 在积累、可训练 | ✅ 继续训 |
+| **~100 episode** | 整条 online 流程 **数据量**目标（含 reference） | 切 policy 后 often **再 50–200 ep** |
+
+- Jerry **「100 个左右才能收敛」**：主要指 online 流程跑够 **~100 局 rollout / 足够 transition**，不是终局 success 100%。
+- Jerry **「接近矩形 ~100%」**：reset 后进入插头正上方工作区（config `xy_half_range_m: 0.05`），**不是**整段插入成功 100%。
+- **Reference 阶段没有「VLA reference 越跑越准」**；Policy 阶段才有 **插入 success 行为收敛** 可言。
+
+#### A.5 卡顿：平滑 vs 超时（可同时存在）
+
+| 原因 | 现象 | 谁提的 |
+|------|------|--------|
+| **Action chunk 无平滑** | 块边界 jerk，「一顿一顿」 | Jerry：预测单元是动作块，需平滑 |
+| **GPU infer 慢** | 动 ~0.5s、停 1–2 min | 文档 / 实测 |
+| **WebSocket timeout** | 断连、部分 transition 未写入 replay | Mickeyy |
+
+平滑（chunk 首尾插值、指令低通）**减轻块内/块边界 jerk**，**不能消除 infer 等待**。超时是 **网络/延迟** 问题，与平滑是不同层。
+
+#### A.6 Policy 阶段要跑多久？
+
+无固定公式。经验：**切 policy 后再 50–200 episode** + **train_steps 再多几百～几千**；以 **success 率高于 reference 且稳定** 为准。infer 慢则 **墙钟远长于 episode 数**（同样 100 ep 可能需数天）。
+
+---
+
+### B. 算法与流程 — 问题分析
+
+> 框架（WebSocket、RL Token、TD3、replay）整体可用；以下为 **影响真机 / 训练质量** 的主要问题（7/10 复核）。
+
+#### B.1 总体判断
+
+| 类别 | 阻止开跑？ | 让训练学不到东西？ |
+|------|------------|-------------------|
+| GPU OOM / server 未 listen | ✅ | — |
+| infer 过慢 + WebSocket timeout | 可能断连 | ✅ 丢 transition |
+| VLA 每步/每 transition 重复全量 infer | — | ✅ 卡顿、有效 step 少 |
+| Action chunk 无时间平滑 | — | ⚠️ 观感差、控制不连贯 |
+| 终局 success 极低（如 1/20） | — | ✅ replay 负样本多 |
+| Replay 重启不持久化 | — | ⚠️ 需重新 warmup |
+| 过早 `mode: policy` | ✅ 真机风险 | ✅ replay 污染 |
+
+#### B.2 已修复 / 已改善（相对 7/5）
+
+| 项 | 状态 |
+|----|------|
+| `actor_loop` 首步 `action_chunk` 顺序 | ✅ 已修 |
+| GPU yaml `inference.mode: reference` | ✅ |
+| SFT VLA + Libero + sft5000 RL Token 对齐 | ✅ |
+| init-cube external reset（与 SFT 一致） | ✅ |
+| `action_is_physical: true` | ✅ |
+| `rl_actor.pt` / `rl_critic.pt` 保存 | ✅ |
+| GPU/工控机 yaml 分离 | ✅ |
+
+#### B.3 仍须关注的问题
+
+**（1）VLA 调用次数过多（卡顿主因之一）**
+
+- 每次 `infer`：`extract_embeddings` + `reference_action`（`embedding_extractor.py`）。
+- 每步 `transition` 算 `next_state` 时再次 `infer_from_proprio`（`rl_server._encode_state`）。
+- 粗算：1 次 chunk infer + 10 步 transition ≈ **11 次** VLA 相关前向/chunk → 墙钟极长。
+
+**（2）Chunk 边界无平滑**
+
+- VLA 一次输出 `chunk_length=10` 步；块间无插值/滤波 → Jerry 所述「一顿一顿」。
+- 与 infer 等待叠加 → 「动一下停很久」。
+
+**（3）稀疏 reward + 低 success**
+
+- 仅 s/f 一步有 1/0；1/20 终局 success → TD3 成功信号极少。
+
+**（4）Replay 不持久化**
+
+- 重启 `rl_server` → buffer 清空；权重可 reload，transition 需重攒。
+
+**（5）工控机 `max_steps_per_episode: 200`**
+
+- @20Hz 约 10s sleep 上限；易 timeout fail（可与 `--max-steps 2400` 临时加大）。
+
+---
+
+### C. 优化方向（按优先级）
+
+| 优先级 | 方向 | 预期效果 | 实现状态 |
+|--------|------|----------|----------|
+| **P0** | 续跑 checklist 打满（§D） | 少报错、少断连 | 流程 |
+| **P1** | 降低 transition 算 `next_state` 的 VLA 开销（仅 embed / 复用 infer 缓存） | **大幅减卡顿** | 待开发 |
+| **P1** | infer 异步：臂执行 chunk 时 GPU 算下一 chunk | 减停顿感 | 待开发 |
+| **P1** | chunk 间 action 平滑（插值/EMA） | 减 jerk（Jerry 建议） | 待开发 |
+| **P2** | reference 多跑 episode（目标 ~100），`--max-steps` 加大 | 更多有效 transition | 操作 |
+| **P2** | 区分指标：reset/接近成功率 vs 终局插入 success | 与 Jerry 对齐评估 | 操作 |
+| **P2** | 加快 infer（GPU 独占、预热、减少重复 forward） | 减 timeout、增 step/局 | 运维+代码 |
+| **P3** | replay buffer 持久化 | 重启不丢数据 | 待开发 |
+| **P4** | reference 稳定 + buffer 够后再切 `policy` | 安全进入 Stage-4 | 操作 |
+
+---
+
+### D. 解决方法与续跑 checklist
+
+#### D.1 开跑前三端
+
+| 终端 | 机器 | 动作 |
+|------|------|------|
+| A | GPU | `CUDA_VISIBLE_DEVICES=1 bash scripts/start_gpu_rl_server.sh`（读 **`plug_insertion_gpu.yaml`**） |
+| B | 工控机 | `bash scripts/gpu/start_ssh_tunnel.sh` 常开 |
+| C | 工控机 | `export GPU_SERVER_HOST=127.0.0.1` + `CONFIRM=1 bash scripts/run_deoxys_actor.sh ...`（读 **`plug_insertion.yaml`**） |
+
+#### D.2 续跑前必查
+
+- [ ] GPU：SFT ckpt、`rl_token.pt`（sft5000 软链）、`rl_server listening`
+- [ ] 工控机：`configs/sft_plug_insertion.yaml` 存在（external reset）
+- [ ] Deoxys 臂/夹爪 + 双 RealSense；**无** `--no-cameras`
+- [ ] actor 终端 **TTY**（能按 s/f）
+- [ ] 两边 **git 同一 commit**（如 `gpu-sync-20260710`）
+- [ ] **勿切 policy**，直到 reference/接近稳定且 `train_steps` 持续增长
+
+#### D.3 推荐运行参数
+
+```bash
+# 工控机 — 单局试跑
+CONFIRM=1 bash scripts/run_deoxys_actor.sh --episodes 1 --max-steps 1200
+
+# 工控机 — 攒数据（学长 ~100 ep 量级）
+CONFIRM=1 bash scripts/run_deoxys_actor.sh --episodes 20 --max-steps 2400
+# 或: export MAX_STEPS=2400
+```
+
+#### D.4 阶段目标（与学长对齐）
+
+```
+1. Reset/接近（进 init 立方体/矩形区）     → 目标 ~100% 稳定
+2. Reference rollout + 攒 replay          → ~50–100 ep，buffer 持续增长
+3. TD3 后台训练（Stage-3）                → train_steps 涨，loss 大致稳定
+4. 切 policy（Stage-4）                   → 短试 5–10 ep → 再 50–200 ep
+5. Policy 收敛                            → success 率高于 reference 且稳定
+```
+
+#### D.5 常见问题对策
+
+| 现象 | 原因 | 处理 |
+|------|------|------|
+| 一顿一顿 | chunk 无平滑 + infer 慢 | 预期部分现象；优先减 infer 重复；后续加平滑 |
+| WebSocket timeout | infer > 客户端等待 | `infer_timeout_sec: 180`；减 VLA 调用次数 |
+| buffer 重启变 0 | 无持久化 | 接受重攒 warmup，或后续做 buffer save |
+| success 1/20 | 任务难 + 稀疏 reward | 正常可继续攒；policy 阶段再判是否变好 |
+| 臂乱动 | 误切 `mode: policy` | 保持 `reference` |
+
+---
+
 ## 最新进度（2026-07-10）
 
 **今日收工状态**（GPU server 已正常退出；`rl_server` shutdown 时已保存 ckpt）：
@@ -307,12 +518,11 @@ action_chunk = result.action_chunk           # ← 应挪到打印之前
 
 见 **§6**（原超时专节）。infer 快时约 30s sleep，人工来不及按 s/f → timeout fail 进 replay。
 
-#### （5）Replay 里 action 是「单步 tile 成 chunk」
+#### （5）Replay 里 action 是「单步 tile 成 chunk」 — ✅ 2026-07-16 已修复（Phase 4）
 
-工控机每步发 **7 维单步** action；GPU `rl_server._as_action_chunk()` 将单步 **复制** 为 `(chunk_length, 7)` 再进 Critic。  
-Policy 模式 Actor 输出的是 **完整 chunk**，与 replay 存储形式不完全一致。
+~~工控机每步发 **7 维单步** action；GPU `rl_server._as_action_chunk()` 将单步 **复制** 为 `(chunk_length, 7)` 再进 Critic。~~
 
-**影响**：Q 学习的是近似形式，可能拖慢收敛（实现简化，非致命）。
+现状：`actor_loop` 按步收集整段 episode，`build_chunk_transitions` 组装**真实** chunk `a_{s:s+C}`（无 tile，`subsample_stride=2`）；`rl_server._as_action_chunk` 严格校验 `(C,7)` 形状；`next_state = x_{s+C}` 且 `learner` 用 `γ^C`。详见 worklog §0.5。
 
 #### （6）稀疏 reward + `batch_size=256`
 
