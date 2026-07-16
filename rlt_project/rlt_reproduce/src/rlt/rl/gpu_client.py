@@ -1,4 +1,11 @@
-"""GPU-side inference client for split online RL (robot PC ↔ GPU host)."""
+"""GPU-side inference client for split online RL (robot PC ↔ GPU host).
+
+NOTE — NOT the robot runtime copy: at runtime the robot imports the ``smq&jgy/src``
+copy of this module (placed first on ``PYTHONPATH`` by ``smq&jgy/scripts/_env.sh``).
+This GPU-side copy is still used by ``rl_server`` (for ``_json_default``). The client
+code is kept identical between the two copies (only this docstring differs) — apply any
+change to both.
+"""
 
 from __future__ import annotations
 
@@ -34,6 +41,15 @@ class GPUClient(ABC):
     @abstractmethod
     def send_transition(self, transition: dict[str, Any]) -> dict[str, Any]:
         """Send one RL transition for learner update on GPU."""
+
+    def encode(self, observation: dict[str, Any]) -> np.ndarray:
+        """Encode an observation into the RL state x = [z_rl || proprio].
+
+        Used to build the per-step state stream (x_0..x_T) so the robot can assemble
+        paper-faithful chunk transitions with an exact C-step gap between
+        ``state`` and ``next_state``.
+        """
+        raise NotImplementedError
 
     def ping(self) -> dict[str, Any]:
         return {"type": "pong", "mock": True}
@@ -71,6 +87,10 @@ class MockGPUClient(GPUClient):
             "updated": True,
             "next_state": self._dummy_state().tolist(),
         }
+
+    def encode(self, observation: dict[str, Any]) -> np.ndarray:
+        del observation
+        return self._dummy_state()
 
     def ping(self) -> dict[str, Any]:
         return {"type": "pong", "mock": True, "buffer_size": len(self._transitions)}
@@ -214,6 +234,28 @@ class WebsocketRLClient(GPUClient):
             state=state,
             meta=meta or None,
         )
+
+    def encode(self, observation: dict[str, Any]) -> np.ndarray:
+        proprio = observation.get("proprio")
+        if proprio is None:
+            raise ValueError("encode observation must include proprio")
+        prepared = ensure_observation_images_jpeg(observation, image_size=self.image_size)
+        msg: dict[str, Any] = {
+            "type": "encode",
+            "proprio": np.asarray(proprio, dtype=np.float32),
+            "language": str(prepared.get("language", "")),
+        }
+        if prepared.get("images_jpeg"):
+            msg["images_jpeg"] = prepared["images_jpeg"]
+        else:
+            raise RuntimeError(
+                "encode payload missing images_jpeg (external + wrist) — "
+                "per-step state encoding needs RealSense RGB frames."
+            )
+        resp = self._request(msg)
+        if resp.get("type") == "error":
+            raise RuntimeError(resp.get("message", "encode failed"))
+        return np.asarray(resp["state"], dtype=np.float32)
 
     def send_transition(self, transition: dict[str, Any]) -> dict[str, Any]:
         msg = {"type": "transition", **transition}

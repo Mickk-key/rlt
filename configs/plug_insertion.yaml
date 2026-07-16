@@ -34,6 +34,10 @@ online_rl:
   chunk_length: 10
   action_dim: 7
   control_hz: 20
+  # Phase 4: subsampling stride for chunk-transition collection (RLT App. B uses 2).
+  # Each episode stream produces transitions (x_s, a_{s:s+C}, ref_{s:s+C}, R, x_{s+C})
+  # for s = 0, stride, 2*stride, ...  Set to chunk_length for non-overlapping chunks.
+  subsample_stride: 2
   max_steps_per_episode: 200
   max_episodes: 50
   reset_mode: workspace
@@ -49,6 +53,18 @@ online_rl:
   use_workspace_reset: true
   # GPU/VLA reference actions are physical EE deltas (m) — same as NPZ, not spacemouse units.
   action_is_physical: true
+
+# Hard robot safety limits — applied to BOTH reference and policy modes in
+# DeoxysEnv.step before FrankaInterface.control(). Bounds the physical per-step
+# EE delta so the arm never receives an unconstrained actor command (RLT paper:
+# action-space bounding). Values equal the DeoxysEnvConfig defaults, made explicit
+# here so they are visible/tunable in the config the robot actually loads.
+safety:
+  enabled: true
+  max_trans_delta_m: 0.02   # per-step Cartesian translation cap (m)
+  max_rot_delta_rad: 0.1    # per-step axis-angle rotation cap (rad)
+  gripper_min: -1.0
+  gripper_max: 1.0
 
 gpu_server:
   mock: false

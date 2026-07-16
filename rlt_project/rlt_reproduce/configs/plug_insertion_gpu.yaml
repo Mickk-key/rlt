@@ -52,8 +52,31 @@ online_rl:
   checkpoint_save_on_shutdown: true
 
 inference:
+  # FIRST FRESH RUN: forced "reference" — execution stays VLA reference REGARDLESS of
+  # buffer count, so policy never runs on unvalidated warmup data. Only after data-QA
+  # (>=500 valid chunk transitions AND >=2-3 successful reference episodes AND verified
+  # shapes/rewards/done) switch this to "auto" and RESTART rl_server. Restart resets the
+  # in-memory replay buffer to 0, so "auto" then re-warms 500 reference transitions and
+  # the ramp cleanly goes alpha 0 -> 1 over the next 500 (warmup_steps/ramp_steps below).
+  #
+  # "auto" = paper-faithful warmup-gated execution (Algorithm 1 line 9):
+  #   buffer_size < warmup_steps        -> execute VLA reference
+  #   warmup <= buffer < warmup+ramp    -> linearly ramp reference -> anchored policy
+  #   buffer_size >= warmup + ramp      -> execute anchored policy
+  # Manual debug overrides: "reference" | "reference_noise" | "policy" (force actor).
   mode: reference
+  ramp_steps: 500          # replay transitions over which alpha goes 0 -> 1 (0 = hard switch)
   reference_noise_std: 0.05
+
+# Paper-faithful deployment anchor (rl/inference_policy.py). The actor still outputs
+# an ABSOLUTE chunk a~pi(a|x,ref) (Eq. 4, NOT a residual); at deployment we bound the
+# deviation so the executed action stays a local edit of the VLA reference:
+#   action = reference + clip(actor - reference, +/- delta)
+policy_anchor:
+  enabled: true
+  max_dev_trans_m: 0.01    # max per-step translation deviation from VLA reference (m)
+  max_dev_rot_rad: 0.05    # max per-step axis-angle rotation deviation (rad)
+  max_dev_grip: 1.0
 
 paths:
   checkpoint_dir: checkpoints

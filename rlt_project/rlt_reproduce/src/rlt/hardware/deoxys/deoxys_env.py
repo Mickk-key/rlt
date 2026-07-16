@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import sys
 import time
 from dataclasses import dataclass, field, replace
@@ -27,6 +28,8 @@ from rlt.util.deoxys_paths import (
     resolve_demo_reset_path,
     smq_root_from_rlt,
 )
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -59,6 +62,14 @@ class DeoxysEnvConfig:
     reset_raw: dict = field(default_factory=dict)
     # GPU/VLA actions are physical EE deltas (m, rad) like NPZ; teleop uses normalized spacemouse units.
     action_is_physical: bool = False
+    # --- Hard robot safety limits (applied to BOTH reference and policy modes) ---
+    # Bounds the physical per-step EE delta the OSC controller will realize, so the
+    # arm never receives an unconstrained actor command (RLT paper: action-space bounding).
+    safety_enabled: bool = True
+    max_trans_delta_m: float = 0.02
+    max_rot_delta_rad: float = 0.1
+    gripper_min: float = -1.0
+    gripper_max: float = 1.0
 
 
 class DeoxysEnv:
@@ -199,6 +210,106 @@ class DeoxysEnv:
             return float(scale.get("translation", 0.05)), float(scale.get("rotation", 1.0))
         return 0.05, 1.0
 
+    def _apply_safety_limits(
+        self,
+        cmd: np.ndarray,
+        *,
+        ctrl_trans: float,
+        ctrl_rot: float,
+    ) -> tuple[np.ndarray, dict]:
+        """Hard safety clamp on the controller command before it reaches the arm.
+
+        Applies to BOTH reference and policy modes so the robot never receives an
+        unconstrained actor output (RLT paper relies on action-space bounding).
+
+        The OSC controller realizes a physical delta ``phys = cmd * ctrl_scale``.
+        The translation (``cmd[:3]``) and axis-angle rotation (``cmd[3:6]``) deltas
+        are clamped by *magnitude* (vector norm), preserving direction, so the
+        physical translation stays within ``max_trans_delta_m`` (m) and the physical
+        rotation angle (= axis-angle norm) within ``max_rot_delta_rad`` (rad). This
+        matches the robot action space: ``cmd[3:6]`` is the OSC_POSE rotation-vector
+        delta in radians (NOT a quaternion and NOT degrees). Non-finite commands
+        hold the pose (zero delta) rather than sending a dangerous command.
+        """
+        cmd = np.asarray(cmd, dtype=np.float32).copy()
+        raw_norm = float(np.linalg.norm(cmd))
+        n = cmd.shape[0]
+
+        # Physical per-step deviations actually realized by the controller.
+        raw_trans_dev_m = float(np.linalg.norm(cmd[:3])) * ctrl_trans if n >= 3 else 0.0
+        raw_rot_dev_rad = float(np.linalg.norm(cmd[3:6])) * ctrl_rot if n >= 6 else 0.0
+
+        if not self.cfg.safety_enabled:
+            return cmd, {
+                "safety_enabled": False,
+                "action_raw_norm": raw_norm,
+                "action_clipped_norm": raw_norm,
+                "action_clipped": False,
+                "action_nan_inf": False,
+                "trans_dev_m": raw_trans_dev_m,
+                "rot_dev_rad": raw_rot_dev_rad,
+            }
+
+        if not np.all(np.isfinite(cmd)):
+            logger.error(
+                "[safety] non-finite action %s — holding pose (zero delta)", cmd.tolist()
+            )
+            hold = np.zeros_like(cmd)
+            return hold, {
+                "safety_enabled": True,
+                "action_nan_inf": True,
+                "action_raw_norm": raw_norm,
+                "action_clipped_norm": 0.0,
+                "action_clipped": True,
+                "trans_dev_m": raw_trans_dev_m,
+                "rot_dev_rad": raw_rot_dev_rad,
+            }
+
+        # Caps expressed in controller-command units (phys = cmd * ctrl_scale).
+        trans_cap = self.cfg.max_trans_delta_m / max(ctrl_trans, 1e-8)
+        rot_cap = self.cfg.max_rot_delta_rad / max(ctrl_rot, 1e-8)
+        clipped = False
+        if n >= 3:
+            cmd[:3], t_clip = self._clip_vec_norm(cmd[:3], trans_cap)
+            clipped = clipped or t_clip
+        if n >= 6:
+            cmd[3:6], r_clip = self._clip_vec_norm(cmd[3:6], rot_cap)
+            clipped = clipped or r_clip
+        if n >= 7:
+            g0 = float(cmd[6])
+            cmd[6] = float(np.clip(g0, self.cfg.gripper_min, self.cfg.gripper_max))
+            clipped = clipped or (cmd[6] != g0)
+
+        clipped_norm = float(np.linalg.norm(cmd))
+        if clipped:
+            logger.warning(
+                "[safety] clamp applied: raw_norm=%.4f -> clipped_norm=%.4f | "
+                "trans_dev=%.4fm (cap %.3f) rot_dev=%.4frad (cap %.3f)",
+                raw_norm,
+                clipped_norm,
+                raw_trans_dev_m,
+                self.cfg.max_trans_delta_m,
+                raw_rot_dev_rad,
+                self.cfg.max_rot_delta_rad,
+            )
+        return cmd, {
+            "safety_enabled": True,
+            "action_nan_inf": False,
+            "action_raw_norm": raw_norm,
+            "action_clipped_norm": clipped_norm,
+            "action_clipped": bool(clipped),
+            "trans_dev_m": raw_trans_dev_m,
+            "rot_dev_rad": raw_rot_dev_rad,
+        }
+
+    @staticmethod
+    def _clip_vec_norm(vec: np.ndarray, cap: float) -> tuple[np.ndarray, bool]:
+        """Scale a vector down to ``cap`` magnitude, preserving direction."""
+        norm = float(np.linalg.norm(vec))
+        if norm > cap and norm > 1e-12:
+            return (vec * (cap / norm)).astype(vec.dtype), True
+        return vec, False
+
     def _apply_demo_reset(self, *, fast: bool = False) -> None:
         if self._demo_sampler is None or self._iface is None:
             self._pose_ready = True
@@ -312,6 +423,7 @@ class DeoxysEnv:
         pos_scale, rot_scale, grip_scale = self.cfg.action_scale
         ctrl_trans, ctrl_rot = self._controller_action_scales()
 
+        safety_info: dict = {}
         if self._iface is None:
             arm_cmd = action[:6].copy()
             if self.cfg.action_is_physical:
@@ -320,6 +432,9 @@ class DeoxysEnv:
             else:
                 arm_cmd[:3] *= pos_scale
                 arm_cmd[3:6] *= rot_scale
+            arm_cmd, safety_info = self._apply_safety_limits(
+                arm_cmd, ctrl_trans=ctrl_trans, ctrl_rot=ctrl_rot
+            )
             self._arm.send_cartesian_delta(arm_cmd)
         else:
             cmd = action.copy()
@@ -332,6 +447,9 @@ class DeoxysEnv:
                 cmd[3:6] *= rot_scale
             if cmd.shape[0] >= 7 and not self.cfg.action_is_physical:
                 cmd[6] *= grip_scale
+            cmd, safety_info = self._apply_safety_limits(
+                cmd, ctrl_trans=ctrl_trans, ctrl_rot=ctrl_rot
+            )
             self._iface.control(
                 controller_type=self.cfg.controller_type,
                 action=cmd,
@@ -342,6 +460,7 @@ class DeoxysEnv:
         info = {
             "step": self._step,
             "gripper_latched": self._gripper_latched,
+            **safety_info,
             **self._last_reset_info,
         }
         return self.get_proprio(), 0.0, False, info
@@ -358,6 +477,8 @@ class DeoxysEnv:
         rl = raw.get("online_rl", {})
         dc = raw.get("data_collection", {})
         sc = raw.get("sft_collection", {})
+
+        safety = raw.get("safety", {})
 
         smq = smq_root_from_rlt(rlt_root)
         reset_raw = resolve_reset_yaml(raw, smq_root=smq)
@@ -413,5 +534,10 @@ class DeoxysEnv:
                 action_is_physical=bool(
                     rl.get("action_is_physical", dc.get("action_is_physical", False))
                 ),
+                safety_enabled=bool(safety.get("enabled", True)),
+                max_trans_delta_m=float(safety.get("max_trans_delta_m", 0.02)),
+                max_rot_delta_rad=float(safety.get("max_rot_delta_rad", 0.1)),
+                gripper_min=float(safety.get("gripper_min", -1.0)),
+                gripper_max=float(safety.get("gripper_max", 1.0)),
             )
         )
