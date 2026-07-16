@@ -218,6 +218,41 @@ def fast_move_to_xyz(
     return steps, pos_err
 
 
+def lift_ee_z(
+    robot_interface,
+    *,
+    lift_m: float,
+    osc_position_cfg,
+    reset_cfg: FastResetConfig | None = None,
+    gripper_cmd: float | None = None,
+    logger=None,
+) -> tuple[int, float]:
+    """Raise EE straight up by ``lift_m`` (xy locked) before any归位 motion.
+
+    Used after a successful insertion: pulling the plug vertically out of the
+    socket first avoids the lateral drag that xy-first reset would otherwise
+    impose on the still-gripped plug.
+    """
+    reset_cfg = reset_cfg or FastResetConfig()
+    log = _resolve_log(logger)
+    if lift_m <= 0.0:
+        return 0, 0.0
+
+    _wait_for_state(robot_interface)
+    current = _current_pos(robot_interface)
+    target = current.copy()
+    target[2] = current[2] + float(lift_m)
+    log(f"[fast_reset] success lift z +{lift_m*100:.1f}cm before归位 (z {current[2]:.4f}→{target[2]:.4f})")
+    return fast_move_to_xyz(
+        robot_interface,
+        target,
+        osc_position_cfg=osc_position_cfg,
+        reset_cfg=reset_cfg,
+        gripper_cmd=reset_cfg.gripper_closed if gripper_cmd is None else gripper_cmd,
+        lock_axes="z",
+    )
+
+
 def fast_approach_to_xyz(
     robot_interface,
     target_xyz: np.ndarray,

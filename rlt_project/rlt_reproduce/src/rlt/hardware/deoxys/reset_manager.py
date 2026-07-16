@@ -46,6 +46,7 @@ class ResetManager:
         smq_root: Path | None = None,
         rlt_root: Path | None = None,
         reset_raw: dict | None = None,
+        success_lift_z_m: float = 0.0,
     ) -> None:
         self.env = env
         self.mode = ResetMode(mode)
@@ -56,6 +57,61 @@ class ResetManager:
         self.smq_root = smq_root
         self.rlt_root = rlt_root
         self.reset_raw = reset_raw or {}
+        self.success_lift_z_m = float(success_lift_z_m)
+        self.last_lift_info: dict = {"applied": False}
+
+    def _lift_after_success(self) -> dict:
+        """Raise EE straight up before归位 when the previous episode succeeded.
+
+        Runs on the actor's own Deoxys client (before any external reset
+        subprocess suspends it), so the still-gripped plug is pulled vertically
+        out of the socket instead of being dragged sideways by xy-first reset.
+
+        Returns a dict with before/after EE positions (for logging / tests).
+        """
+        info: dict = {"applied": False, "lift_z_m": self.success_lift_z_m}
+        if self.success_lift_z_m <= 0.0:
+            print(f"[reset] success z-lift disabled (success_lift_z_m={self.success_lift_z_m})")
+            return info
+        iface = self.env._iface
+        if iface is None or self.env._osc_position_cfg is None:
+            print("[reset] success z-lift skipped — no live Deoxys client (iface/osc cfg is None)")
+            return info
+
+        from rlt.hardware.deoxys.collection_reset import collection_reset_settings
+        from rlt.hardware.deoxys.fast_reset import lift_ee_z
+
+        _, fast_cfg = collection_reset_settings(self.reset_raw)
+        before = self.env.get_proprio()[:3].astype(float)
+        print(
+            f"[reset] SUCCESS-LIFT branch entered: raising EE +{self.success_lift_z_m*100:.1f}cm "
+            f"in z (xy locked, gripper closed) from ee_xyz={before.round(4).tolist()}"
+        )
+        try:
+            steps, pos_err = lift_ee_z(
+                iface,
+                lift_m=self.success_lift_z_m,
+                osc_position_cfg=self.env._osc_position_cfg,
+                reset_cfg=fast_cfg,
+            )
+            after = self.env.get_proprio()[:3].astype(float)
+            info.update(
+                applied=True,
+                steps=int(steps),
+                pos_err_m=float(pos_err),
+                before_xyz=before.tolist(),
+                after_xyz=after.tolist(),
+                delta_xyz=(after - before).tolist(),
+            )
+            print(
+                f"[reset] success z-lift done steps={steps} pos_err={pos_err*100:.2f}cm "
+                f"ee_xyz={after.round(4).tolist()} "
+                f"Δxyz(cm)={((after - before) * 100).round(2).tolist()}"
+            )
+        except Exception as exc:  # never block reset on a lift failure
+            info["error"] = str(exc)
+            print(f"[reset] success z-lift skipped ({exc})")
+        return info
 
     def _prepare_episode_gripper(self) -> None:
         """Latch gripper closed for critical-phase rollout when configured."""
@@ -108,11 +164,23 @@ class ResetManager:
         self.env._last_reset_info = dict(info)
         return proprio, info
 
-    def reset(self) -> tuple[np.ndarray, dict]:
-        """Run reset pipeline; return initial proprio and metadata."""
+    def reset(self, *, prev_success: bool = False) -> tuple[np.ndarray, dict]:
+        """Run reset pipeline; return initial proprio and metadata.
+
+        When ``prev_success`` is set, first raise the EE straight up (z only) so
+        the gripped plug leaves the socket vertically before any归位 motion.
+        """
         import time
 
         info: dict = {"reset_mode": self.mode.value}
+
+        print(f"[reset] prev_success={prev_success} success_lift_z_m={self.success_lift_z_m}")
+        self.last_lift_info: dict = {"applied": False}
+        if prev_success:
+            self.last_lift_info = self._lift_after_success()
+            info["success_lift"] = self.last_lift_info
+        else:
+            print("[reset] prev_success=False → skipping success z-lift, going straight to归位")
 
         if self.mode == ResetMode.HOME:
             if self.env._iface is None:
@@ -200,4 +268,5 @@ class ResetManager:
             smq_root=smq,
             rlt_root=rlt_root,
             reset_raw=reset_raw,
+            success_lift_z_m=float(online.get("success_lift_z_m", 0.06)),
         )
