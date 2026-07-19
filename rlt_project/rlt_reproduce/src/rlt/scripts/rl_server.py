@@ -436,7 +436,19 @@ async def _serve(server: RLServer, host: str, port: int) -> None:
             reply = await server.handle_message(raw)
             await ws.send(reply)
 
-    async with websockets.serve(handler, host, port):
+    async with websockets.serve(
+        handler,
+        host,
+        port,
+        # The VLA infer inside handle_message runs synchronously and blocks the asyncio
+        # event loop for 1-2 min. With default keepalive (ping every 20s, 20s timeout)
+        # the connection is force-closed mid-infer ("1011 keepalive ping timeout").
+        # Disable keepalive; the client uses an explicit per-request recv timeout instead.
+        ping_interval=None,
+        ping_timeout=None,
+        max_size=None,  # allow large JPEG image payloads
+        close_timeout=5,
+    ):
         logger.info("RL server listening on ws://%s:%d", host, port)
         await asyncio.Future()
 

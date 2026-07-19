@@ -145,7 +145,15 @@ class WebsocketRLClient(GPUClient):
                 await self._ws.close()
             except Exception:
                 pass
-        self._ws = await websockets.connect(self._uri, open_timeout=self.timeout_sec)
+        # ping_interval=None: the server blocks its event loop during the multi-minute
+        # VLA infer, so keepalive pings would false-timeout and drop the connection.
+        # We rely on the explicit per-request recv timeout (self.timeout_sec) instead.
+        self._ws = await websockets.connect(
+            self._uri,
+            open_timeout=self.timeout_sec,
+            ping_interval=None,
+            max_size=None,
+        )
 
     async def _request_async(self, payload: dict[str, Any]) -> dict[str, Any]:
         import websockets
