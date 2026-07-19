@@ -274,6 +274,8 @@ def run_episode(
     stream_interventions: list[bool] = []  # human-takeover flag per step
     terminated = False
     outcome: EpisodeOutcome | None = None
+    intervening = False  # edge-tracking for teleop begin/end logging
+    n_intervened_steps = 0
 
     while not terminated:
         obs = _build_observation(
@@ -342,6 +344,21 @@ def run_episode(
                     action = teleop_action.astype(np.float32)
                     ref_step = teleop_action.astype(np.float32)
                     intervened = True
+
+            # Edge-triggered teleop takeover logging (observability only).
+            if intervened and not intervening:
+                console.print(
+                    f"[magenta]>>> TELEOP intervention BEGIN[/magenta] at step {step + 1} "
+                    f"(human overrides reference; action_pos_m={action[:3].round(5).tolist()})"
+                )
+            elif not intervened and intervening:
+                console.print(
+                    f"[magenta]<<< TELEOP intervention END[/magenta] at step {step + 1} "
+                    "(control returned to VLA reference)"
+                )
+            intervening = intervened
+            if intervened:
+                n_intervened_steps += 1
 
             ee_before = proprio[:3].copy()
 
@@ -433,7 +450,8 @@ def run_episode(
             )
         console.print(
             f"[green]Episode {episode_id} done[/green] "
-            f"reason={outcome.reason} reward={outcome.reward} steps={step}"
+            f"reason={outcome.reason} reward={outcome.reward} steps={step} "
+            f"teleop_intervened_steps={n_intervened_steps}/{step}"
         )
         return outcome
     raise RuntimeError("episode ended without an outcome")

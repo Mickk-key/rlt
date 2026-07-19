@@ -64,7 +64,7 @@ online_rl:
   # is stored as action=reference=teleop with an intervened flag. Reuses the SFT
   # SpaceMouse ids from data_collection unless overridden here. s/f/q are unchanged.
   teleop_intervention:
-    enabled: false
+    enabled: true
     trans_deadzone: 0.15   # SpaceMouse translation magnitude (controller units) to engage
     rot_deadzone: 0.15     # SpaceMouse rotation magnitude (controller units) to engage
     # spacemouse_vendor_id: 9583
