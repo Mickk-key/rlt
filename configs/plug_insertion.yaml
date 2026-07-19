@@ -57,6 +57,18 @@ online_rl:
   use_workspace_reset: true
   # GPU/VLA reference actions are physical EE deltas (m) — same as NPZ, not spacemouse units.
   action_is_physical: true
+  # Optional human teleop intervention during rollout (RLT Sec. V), HG-DAgger style.
+  # DISABLED by default; only activates if enabled AND a SpaceMouse opens. While the
+  # operator pushes the puck past the deadzone, the teleop action overrides the
+  # policy/reference action for that step (still passes the Phase-1 safety clamp) and
+  # is stored as action=reference=teleop with an intervened flag. Reuses the SFT
+  # SpaceMouse ids from data_collection unless overridden here. s/f/q are unchanged.
+  teleop_intervention:
+    enabled: false
+    trans_deadzone: 0.15   # SpaceMouse translation magnitude (controller units) to engage
+    rot_deadzone: 0.15     # SpaceMouse rotation magnitude (controller units) to engage
+    # spacemouse_vendor_id: 9583
+    # spacemouse_product_id: 50746
 
 # Hard robot safety limits — applied to BOTH reference and policy modes in
 # DeoxysEnv.step before FrankaInterface.control(). Bounds the physical per-step

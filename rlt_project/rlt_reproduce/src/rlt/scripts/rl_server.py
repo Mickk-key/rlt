@@ -369,6 +369,7 @@ class RLServer:
                 next_state=next_state,
                 done=bool(msg["done"]),
                 next_reference_action=next_reference,
+                intervened=float(msg.get("intervened", 0.0)),
             )
         )
         updated = False

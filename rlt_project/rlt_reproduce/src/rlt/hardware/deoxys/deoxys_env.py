@@ -200,6 +200,15 @@ class DeoxysEnv:
         width = np.array([self._gripper.position], dtype=np.float32)
         return np.concatenate([pos, quat, width]).astype(np.float32)
 
+    def controller_action_scales(self) -> tuple[float, float]:
+        """Public: OSC controller (translation, rotation) scales.
+
+        The controller realises ``phys = cmd * scale``; teleop intervention uses
+        these to convert SpaceMouse controller-unit actions into the physical
+        EE-delta space shared by the VLA reference and RL actor.
+        """
+        return self._controller_action_scales()
+
     def _controller_action_scales(self) -> tuple[float, float]:
         if self._controller_cfg is None:
             return 0.05, 1.0

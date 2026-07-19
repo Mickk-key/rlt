@@ -27,6 +27,9 @@ class Transition:
     next_state: np.ndarray
     done: bool
     next_reference_action: np.ndarray | None = None
+    # Fraction/flag of steps in the chunk driven by a human teleop takeover
+    # (RLT Sec. V intervention). Metadata only — not used by the TD3 update.
+    intervened: float = 0.0
 
 
 class ReplayBuffer:

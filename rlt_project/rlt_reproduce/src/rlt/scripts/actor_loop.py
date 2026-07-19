@@ -127,6 +127,7 @@ def build_chunk_transitions(
     chunk_length: int,
     stride: int,
     terminated: bool,
+    interventions: list[bool] | None = None,
 ) -> list[dict[str, Any]]:
     """Assemble paper-faithful chunk transitions from an episode's per-step stream.
 
@@ -175,6 +176,14 @@ def build_chunk_transitions(
             out.append(0.0)
         return out[:C]
 
+    def intervened_frac(start: int) -> float:
+        if not interventions:
+            return 0.0
+        window = interventions[start : start + C]
+        if not window:
+            return 0.0
+        return float(sum(1 for x in window if x)) / float(len(window))
+
     transitions: list[dict[str, Any]] = []
     emitted: set[int] = set()
 
@@ -189,6 +198,7 @@ def build_chunk_transitions(
                 "rewards": reward_chunk(s),
                 "next_state": np.asarray(states[min(e, T)], dtype=np.float32),
                 "done": bool(done),
+                "intervened": intervened_frac(s),
                 "_t_start": int(s),
                 "_t_next": int(min(e, T)),
                 "_n_real_steps": int(min(e, T) - s),
@@ -238,6 +248,7 @@ def run_episode(
     subsample_stride: int = 2,
     image_size: tuple[int, int] | None = None,
     frame_cache: dict[str, np.ndarray] | None = None,
+    teleop=None,
 ) -> EpisodeOutcome:
     """One critical-phase episode: infer chunks, execute, build chunk transitions.
 
@@ -260,6 +271,7 @@ def run_episode(
     stream_actions: list[np.ndarray] = []  # a_0 .. a_{T-1}
     stream_refs: list[np.ndarray] = []  # ref_0 .. ref_{T-1}
     stream_rewards: list[float] = []  # r_0 .. r_{T-1}
+    stream_interventions: list[bool] = []  # human-takeover flag per step
     terminated = False
     outcome: EpisodeOutcome | None = None
 
@@ -318,12 +330,26 @@ def run_episode(
         for i in range(n_exec):
             action = exec_chunk[i].astype(np.float32)
             ref_step = ref_chunk[i].astype(np.float32)
+
+            # Human teleop takeover (RLT Sec. V), if enabled and engaged. The
+            # teleop action is already in physical EE-delta units, executed via the
+            # same env.step (Phase-1 safety clamp preserved); on intervened steps
+            # the human action also REPLACES the stored reference (BC target).
+            intervened = False
+            if teleop is not None:
+                teleop_action, engaged = teleop.poll()
+                if engaged and teleop_action is not None:
+                    action = teleop_action.astype(np.float32)
+                    ref_step = teleop_action.astype(np.float32)
+                    intervened = True
+
             ee_before = proprio[:3].copy()
 
             # Record the pre-step state x_step and the executed/reference action.
             stream_states.append(cur_state)
             stream_actions.append(action)
             stream_refs.append(ref_step)
+            stream_interventions.append(intervened)
 
             next_proprio, _, _, _ = env.step(action)
             step += 1
@@ -378,6 +404,7 @@ def run_episode(
         chunk_length=chunk_length,
         stride=subsample_stride,
         terminated=terminated,
+        interventions=stream_interventions,
     )
     last_resp: dict[str, Any] = {}
     for tr in transitions:
@@ -542,6 +569,25 @@ def main() -> None:
             f"(init cube random xy — same as SFT collection)"
         )
 
+    teleop = None
+    if not env_mock and hasattr(env, "controller_action_scales"):
+        from rlt.teleop.intervention import build_intervention
+
+        ctrl_trans, ctrl_rot = env.controller_action_scales()
+        controller_type = raw.get("data_collection", {}).get("controller_type", "OSC_POSE")
+        teleop = build_intervention(
+            raw,
+            ctrl_trans=ctrl_trans,
+            ctrl_rot=ctrl_rot,
+            controller_type=controller_type,
+            action_dim=action_dim,
+        )
+        if teleop is not None:
+            console.print(
+                "[magenta]Teleop intervention ENABLED[/magenta] — push the SpaceMouse to take "
+                "over; release to hand control back to the policy (s/f/q unchanged)"
+            )
+
     console.print(
         "Controls: [green]s[/green]=success (reward=1)  "
         "[red]f[/red]=fail  [yellow]q[/yellow]=quit  "
@@ -583,12 +629,15 @@ def main() -> None:
                     subsample_stride=subsample_stride,
                     image_size=image_size,
                     frame_cache=camera_frame_cache,
+                    teleop=teleop,
                 )
                 prev_success = bool(outcome is not None and outcome.reason == "success_key")
                 if outcome is not None and outcome.reason == "quit":
                     console.print("[yellow]q pressed → stopping rollout run[/yellow]")
                     break
     finally:
+        if teleop is not None:
+            teleop.close()
         if camera_manager is not None:
             camera_manager.stop()
         if hasattr(env, "close"):
