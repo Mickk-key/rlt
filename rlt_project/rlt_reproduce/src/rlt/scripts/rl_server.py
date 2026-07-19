@@ -101,6 +101,10 @@ class RLServer:
             critic_lr=rl["critic_lr"],
             critic_ensemble=rl["critic_ensemble"],
             target_tau=rl["target_update_tau"],
+            action_box=rl.get("action_box"),
+            target_policy_noise=rl.get("target_policy_noise", 0.2),
+            target_noise_clip=rl.get("target_noise_clip", 0.5),
+            grad_clip_norm=rl.get("grad_clip_norm", 10.0),
         )
 
         actor_ckpt = ckpt_dir / "rl_actor.pt"

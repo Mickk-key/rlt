@@ -47,6 +47,17 @@ online_rl:
   critic_hidden: [256, 256]
   critic_ensemble: 2
   target_update_tau: 0.005
+  # Global physical delta-action box (RLT App. C "action-space bounding box"): the
+  # actor mean is tanh-bounded to ±action_box and sampled/target actions are clamped
+  # to it, so training and deployment share one in-distribution action set (TD3
+  # stability). This box is the VALID ROBOT ACTION DOMAIN and is INDEPENDENT of the
+  # VLA reference — locality toward the VLA is the SEPARATE soft BC term
+  # (policy_constraint_beta·‖a−ref‖²). Units: [x,y,z (m), rx,ry,rz (rad), gripper].
+  # Matches the Deoxys per-step safety clamp (0.02 m / 0.10 rad).
+  action_box: [0.02, 0.02, 0.02, 0.10, 0.10, 0.10, 1.0]
+  target_policy_noise: 0.2   # TD3 target-smoothing std, as a fraction of action_box
+  target_noise_clip: 0.5     # TD3 target-smoothing clip, as a fraction of action_box
+  grad_clip_norm: 10.0       # max global grad norm for actor & critic (defense-in-depth)
   checkpoint_save_interval_updates: 50
   checkpoint_keep_last: 5
   checkpoint_save_on_shutdown: true
@@ -68,12 +79,16 @@ inference:
   ramp_steps: 500          # replay transitions over which alpha goes 0 -> 1 (0 = hard switch)
   reference_noise_std: 0.05
 
-# Paper-faithful deployment anchor (rl/inference_policy.py). The actor still outputs
-# an ABSOLUTE chunk a~pi(a|x,ref) (Eq. 4, NOT a residual); at deployment we bound the
-# deviation so the executed action stays a local edit of the VLA reference:
-#   action = reference + clip(actor - reference, +/- delta)
+# DEPLOYMENT-ONLY reference-relative anchor (rl/inference_policy.py).
+# NOTE: this is an ENGINEERING SAFETY LAYER for early robot validation and is NOT
+# part of the core RLT paper algorithm. The paper enforces locality via the SOFT BC
+# term (Eq. 5) + the global action box above, not a hard reference-relative clip.
+# The learner does NOT use this anchor (training operates on globally-bounded absolute
+# actions). Keep it enabled while validating the bounded actor; once the actor is
+# verified stable, set enabled=false so the train and deploy action domains match
+# (both = the global action_box). The Deoxys per-step safety clamp stays active either way.
 policy_anchor:
-  enabled: true
+  enabled: true            # engineering safety only; relax to false after actor is verified
   max_dev_trans_m: 0.01    # max per-step translation deviation from VLA reference (m)
   max_dev_rot_rad: 0.05    # max per-step axis-angle rotation deviation (rad)
   max_dev_grip: 1.0
