@@ -46,7 +46,7 @@ from rlt.rl.reward_logger import EpisodeOutcome, RewardLogger
 from rlt.rl.ws_protocol import ensure_observation_images_jpeg
 from rlt.sim.mock_env import MockPrecisionEnv
 from rlt.util.deoxys_paths import apply_deoxys_paths
-from rlt.util.terminal_keys import stdin_is_tty, terminal_keys
+from rlt.util.terminal_keys import flush_input, stdin_is_tty, terminal_keys
 
 console = Console()
 
@@ -293,6 +293,11 @@ def run_episode(
                 "[yellow]First GPU VLA infer may take 30–90s (CUDA warmup). Please wait…[/yellow]"
             )
         result = gpu.infer(obs)
+        if step == 0:
+            # Drop keys buffered during reset + the first CUDA-warmup infer so a
+            # stray 'q'/'f'/'s' doesn't terminate the episode at step 1
+            # (reason=quit, steps=1). See terminal_keys.flush_input.
+            flush_input()
         if result.state is None:
             raise RuntimeError("GPU infer missing encoded state — restart GPU rl_server with latest code")
         # State at the current planning boundary (recomputed each infer; identical to
@@ -580,6 +585,9 @@ def main() -> None:
                     frame_cache=camera_frame_cache,
                 )
                 prev_success = bool(outcome is not None and outcome.reason == "success_key")
+                if outcome is not None and outcome.reason == "quit":
+                    console.print("[yellow]q pressed → stopping rollout run[/yellow]")
+                    break
     finally:
         if camera_manager is not None:
             camera_manager.stop()

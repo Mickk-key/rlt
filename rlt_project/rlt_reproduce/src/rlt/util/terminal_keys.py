@@ -36,3 +36,23 @@ def poll_key() -> int:
         return 0
     ch = sys.stdin.read(1)
     return ord(ch) if ch else 0
+
+
+def flush_input() -> None:
+    """Discard any keystrokes buffered on stdin (no-op if not a TTY).
+
+    stdin is held in cbreak mode for the whole rollout, so keys typed during the
+    long non-interactive windows (external reset subprocess, camera restart,
+    post-reset warmup, first 30-90s CUDA-warmup infer) stay buffered and would
+    otherwise be consumed at step 1 of the next episode — e.g. a stray ``q`` ends
+    the episode immediately (reason=quit, steps=1). Draining before execution
+    starts makes the s/f/q keys reflect only what the operator presses *during*
+    the episode."""
+    if not stdin_is_tty():
+        return
+    try:
+        while select.select([sys.stdin], [], [], 0)[0]:
+            if not sys.stdin.read(1):
+                break
+    except (OSError, ValueError):
+        pass
