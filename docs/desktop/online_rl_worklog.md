@@ -1,5 +1,10 @@
 # Plug Insertion Online RL — 工作文档
 
+> **⚠️ SUPERSEDED (2026-07-19).** The authoritative RLT online-RL runbook is now
+> [`ONLINE_RL_RUNBOOK.md`](../../rlt_project/rlt_reproduce/docs/ONLINE_RL_RUNBOOK.md).
+> Follow that file for the full workflow; the §0 notes below and the rest of this
+> worklog are kept for history/background.
+
 > 最后更新：**2026-07-16**  
 > 任务：Franka FR3 + Franka Hand + 2× RealSense，插插头 online RL  
 > 操作指南：[`docs/ONLINE_RL_ROBOT.md`](../ONLINE_RL_ROBOT.md)

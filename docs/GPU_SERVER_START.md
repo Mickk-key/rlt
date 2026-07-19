@@ -1,5 +1,9 @@
 # GPU 端启动 smq&jgy JPEG WebSocket Server
 
+> **⚠️ SUPERSEDED (2026-07-19).** The authoritative RLT online-RL runbook is now
+> [`ONLINE_RL_RUNBOOK.md`](../rlt_project/rlt_reproduce/docs/ONLINE_RL_RUNBOOK.md).
+> Follow that file for the full workflow; this doc is kept for history.
+
 > **工控机连的是 `10.176.53.120:8765`**（工控机 `10.162.132.11` 能 ping 通）。  
 > **fvl08（192.168.110.18）与工控机不在同一可达网段**，在 fvl08 上起 server 工控机连不上。  
 > **最后更新**：2026-07-10
@@ -55,8 +59,8 @@ cd /sdb/private_folders/shimingqi/smq_jgy_deploy/smq\&jgy/rlt_project/rlt_reprod
 # 或 ~/smq_jgy/.../rlt_reproduce
 
 export CUDA_VISIBLE_DEVICES=1   # 2026-07-10 使用 GPU1；按 nvidia-smi 调整
-bash scripts/start_gpu_rl_server.sh
-# 等价: bash scripts/run_rl_server.sh configs/plug_insertion_gpu.yaml
+cd "/sdb/private_folders/shimingqi/smq_jgy_deploy/smq&jgy/rlt_project/rlt_reproduce"
+CUDA_VISIBLE_DEVICES=1 bash scripts/start_gpu_rl_server.sh configs/plug_insertion_gpu.yaml
 ```
 
 **当前默认**：`inference.mode: reference`（`plug_insertion_gpu.yaml`）。

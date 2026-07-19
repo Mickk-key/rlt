@@ -1,5 +1,9 @@
 # 工控机 Online RL Rollout 指南
 
+> **⚠️ SUPERSEDED (2026-07-19).** The authoritative RLT online-RL runbook is now
+> [`ONLINE_RL_RUNBOOK.md`](../rlt_project/rlt_reproduce/docs/ONLINE_RL_RUNBOOK.md).
+> Follow that file for the full workflow; this doc is kept for history.
+
 > 工作目录：`/home/host5010/workspaces/smq&jgy`  
 > 最后更新：**2026-07-10**  
 > Actor 配置：`configs/plug_insertion.yaml`  

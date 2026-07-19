@@ -1,5 +1,9 @@
 # Online RL 工作计划 — 插充电器 Critical Phase
 
+> **⚠️ SUPERSEDED (2026-07-19).** The authoritative RLT online-RL runbook is now
+> [`ONLINE_RL_RUNBOOK.md`](ONLINE_RL_RUNBOOK.md). Follow that file for the full
+> workflow; this plan is kept for history/background.
+
 > **任务**：Franka 插充电器，双机 split online RL（RLT Algorithm 1）  
 > **最后更新**：2026-07-10  
 > **工控机**：`10.162.132.11`，工作目录 `smq&jgy`  

@@ -1,5 +1,9 @@
 # RLT 在线 RL 双机拆分 — 任务清单
 
+> **⚠️ SUPERSEDED (2026-07-19).** The authoritative RLT online-RL runbook is now
+> [`ONLINE_RL_RUNBOOK.md`](rlt_project/rlt_reproduce/docs/ONLINE_RL_RUNBOOK.md).
+> Follow that file for the full workflow; this doc is kept for history.
+
 > **工控机** `10.162.132.11` → **GPU** `10.176.53.120:8765`（JPEG WebSocket）  
 > 工作目录：`/home/host5010/workspaces/smq&jgy`
 

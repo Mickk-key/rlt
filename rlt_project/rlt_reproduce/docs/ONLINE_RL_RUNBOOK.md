@@ -1,138 +1,99 @@
-# Plug Insertion Online RL — 启动流程与当前进度
+# RLT Online-RL — Authoritative Runbook (Plug Insertion)
 
-> **任务**：Franka 插充电器 critical phase，双机 split online RL（RLT 论文 Algorithm 1）  
-> **最后更新**：2026-07-10  
-> **GPU 主机**：fvl08（内网 `192.168.110.18`，对外 `10.176.53.120`）  
-> **工控机**：`10.162.132.11`，工作目录 `/home/host5010/workspaces/smq&jgy`
+> **THIS IS THE SINGLE SOURCE OF TRUTH** for the complete dual-machine RLT online-RL
+> workflow after the Phase 1–5 fixes. If any other doc disagrees, follow this file.
+>
+> **Last updated:** 2026-07-19 · **Repo revision baseline:** `origin/main @ 07b9a8e`
+> **Task:** Franka plug insertion, split online RL (RLT paper, Algorithm 1)
+> **GPU host:** fvl08 (`10.176.53.120`, internal `192.168.110.18`) — runs `rl_server`
+> **Robot PC:** `10.162.132.11`, workspace `.../smq&jgy` — runs `actor_loop` + Deoxys
+>
+> **Superseded by this runbook** (kept for history only): `docs/GPU_SERVER_START.md`,
+> `docs/ONLINE_RL_ROBOT.md`, `docs/desktop/online_rl_worklog.md`,
+> `docs/ONLINE_RL_WORK_PLAN.md`, `ONLINE_RL_TASKS.md`.
 
 ---
 
-## 1. 架构一览
+## 0. What changed (Phase 1–5) — read first
+
+| Phase | Change | File (runtime tree) | Effect |
+|-------|--------|---------------------|--------|
+| **1** | Hard EE-delta safety clamp | `deoxys_env.py` (Tree B) | Bounds physical per-step delta for **both** reference and policy; NaN→hold pose |
+| **2** | Paper-faithful deployment anchor | `inference_policy.py` (Tree B) | `action = reference + clip(actor − reference, ±δ)`; actor stays absolute `a~π(a\|x,ref)`, **not** residual |
+| **3** | Warmup gating + linear ramp | `inference_policy.act_gated` / `rl_server.py` (Tree B) | Execution keyed on replay-buffer transition count, not a manual switch |
+| **4** | Real chunk transitions | `actor_loop.py` (Tree C) + `rl_server.py`/`learner.py`/`replay_buffer.py` (Tree B) | `(x_s, a_{s:s+C}, ref_{s:s+C}, ref_{s+C:s+2C}, R=Σγ^k r, x_{s+C}, done)`; no tiling; `γ^C` |
+| **5** | Fresh actor/critic reset | checkpoints + config | Actor/critic/replay restart from scratch; SFT VLA + RL token **unchanged** |
+
+**Reuse (never delete/retrain here):** SFT VLA (`pi05_base`, `pi05_plug_insertion`) and RL token (`rl_token.pt`).
+**Online-RL components that get reset/restarted:** actor (`rl_actor.pt`), critic (`rl_critic.pt`), and the in-memory replay buffer.
+
+---
+
+## 1. Runtime source-tree mapping (critical)
+
+Both source trees live in **one git repo** (`smq&jgy`). At runtime, which copy loads depends on `PYTHONPATH`:
+
+| Component | Runtime tree | Exact path | Why |
+|-----------|--------------|-----------|-----|
+| `actor_loop.py` (robot rollout) | **Tree C** | `smq&jgy/src/rlt/scripts/actor_loop.py` | `_env.sh` puts `smq&jgy/src` **first** on `PYTHONPATH`, overriding Tree B |
+| `gpu_client.py` (robot↔GPU) | **Tree C** | `smq&jgy/src/rlt/rl/gpu_client.py` | same |
+| `rl_server.py` (GPU) | **Tree B** | `rlt_project/rlt_reproduce/src/rlt/scripts/rl_server.py` | `run_rl_server.sh` uses only Tree B `src` |
+| `learner.py` (TD3) | **Tree B** | `.../rlt_reproduce/src/rlt/rl/learner.py` | GPU side |
+| `replay_buffer.py` | **Tree B** | `.../rlt_reproduce/src/rlt/rl/replay_buffer.py` | GPU side |
+| `inference_policy.py` (gating + anchor) | **Tree B** | `.../rlt_reproduce/src/rlt/rl/inference_policy.py` | GPU side |
+| `deoxys_env.py` (safety clamp) | **Tree B** | `.../rlt_reproduce/src/rlt/hardware/deoxys/deoxys_env.py` | robot execs with `cd RLT_ROOT`=Tree B |
+
+**Config paths:**
+
+| Config | Loaded by | Path |
+|--------|-----------|------|
+| GPU server | `run_rl_server.sh` (Tree B) | `rlt_project/rlt_reproduce/configs/plug_insertion_gpu.yaml` |
+| Robot actor | `_env.sh` → `RLT_COLLECT_CONFIG` | `smq&jgy/configs/plug_insertion.yaml` (Tree C) |
+
+> **Sync rule:** `actor_loop.py` and `gpu_client.py` transition logic is kept **byte-identical**
+> across Tree B and Tree C (only docstrings + `main()` bootstrap differ). Edit one → edit both.
+> A Tree C mirror of `plug_insertion_gpu.yaml` exists for parity but is **not** the one `rl_server` loads.
+
+---
+
+## 2. Architecture
 
 ```
-工控机 10.162.132.11                    GPU fvl08 / 10.176.53.120
-┌────────────────────────────┐          ┌─────────────────────────────┐
-│ RealSense D435 ×2 (USB)    │  JPEG    │ start_gpu_rl_server.sh      │
-│ Deoxys 臂 + 夹爪 (ZMQ)     │  WS      │  rl_server.py               │
-│ actor_loop.py              │ ───────► │  pi05 VLA + RL token        │
-│ RewardLogger (s/f/q)       │  :8765   │  actor/critic + replay      │
-└────────────────────────────┘          └─────────────────────────────┘
+Robot PC 10.162.132.11                     GPU fvl08 / 10.176.53.120
+┌────────────────────────────┐             ┌─────────────────────────────┐
+│ RealSense D435 ×2 (USB)     │   JPEG WS   │ start_gpu_rl_server.sh       │
+│ Deoxys arm + gripper (ZMQ)  │  ─────────► │  rl_server.py                │
+│ actor_loop.py (Tree C)      │   :8765     │  pi05 VLA + RL token         │
+│ RewardLogger (s/f/q keys)   │             │  actor/critic + replay (TD3) │
+└────────────────────────────┘             └─────────────────────────────┘
 ```
 
-| 组件 | 协议 | 说明 |
-|------|------|------|
-| 工控机 actor | `run_deoxys_actor.sh` → `actor_loop.py` | 本地采图，WebSocket 发 GPU |
-| GPU server | `scripts/start_gpu_rl_server.sh` → `rl_server.py` | **JPEG base64 JSON**，不是 msgpack |
-| 图像 | `external` + `wrist` → `images_jpeg` | GPU **不接 USB 相机** |
-| 控制 | Deoxys ZMQ 5555/5557 | 仅臂/夹爪，不传图 |
-
-**GPU 需求**：**1 张整卡**（建议 24GB 基本空闲）。现有代码 **不支持多卡**；工控机 **0 GPU**。
+- GPU needs **1 whole GPU** (~24 GB free). No multi-GPU. Robot PC uses **0 GPU**.
+- Transport is JPEG-base64 JSON over WebSocket. GPU has **no** cameras.
 
 ---
 
-## 2. 当前进度总表（2026-07-10）
+## 3. Prerequisites
 
-| 阶段 | 内容 | 状态 | 备注 |
-|------|------|------|------|
-| **Stage-0** | 数据采集 51 success + 50 fail | ✅ 完成 | `data/plug_insertion/` |
-| **Stage-1** | RL Token 离线训练 | ✅ 完成 | `rl_token.pt` → sft5000 软链 |
-| **Stage-2a** | 双机 WebSocket 通路 | ✅ 完成 | SSH 隧道 + 真机 infer |
-| **Stage-2b** | GPU 部署 smq&jgy + 真实 VLA 代码 | ✅ 完成 | deploy 树 fvl08 |
-| **Stage-2c** | 真实 VLA + 双路相机 infer | ✅ **完成** | Libero 格式 + SFT 5000 ckpt |
-| **Stage-2d** | reference 真机 rollout | 🟡 **部分完成** | ~20+ ep；success 少；motion 卡（infer 慢） |
-| **Stage-3** | replay warmup 500 + TD3 | 🟡 **进行中** | 收工：buffer **578**，train **395**，有 actor/critic ckpt |
-| **Stage-4** | `inference.mode: policy` | ⬜ 未开始 | 仍为 reference |
-| **网络** | `10.176.53.120:8765` 直连 | 🟡 | 建议 SSH 隧道 |
-| **GPU 资源** | 独占 1×3090 | ✅ | `CUDA_VISIBLE_DEVICES=1` 已验证 |
-
-### 收工 checkpoint（deploy 树）
-
-```
-checkpoints/rl_actor.pt          # 2026-07-10 06:29
-checkpoints/rl_critic.pt
-checkpoints/online_rl/rl_*_step000150~350_*.pt
-checkpoints/rl_actor.pt.presft_bak   # 旧备份，保留
-```
+- [ ] GPU: ≥1 free ~24 GB card; `checkpoints/rl_token.pt`, `pi05_base`, `pi05_plug_insertion` present.
+- [ ] GPU env: launch **only** via `start_gpu_rl_server.sh` (it `source`s `activate_rlt.sh`, which activates the `rlt` conda env **and** adds the openpi `.venv` to `PYTHONPATH` for `jax`/`openpi`/`websockets`). Running `run_rl_server.sh` directly from `(base)` → `ModuleNotFoundError: websockets`.
+- [ ] Robot: Deoxys arm/gripper SOP works; RealSense serials match yaml; terminal is a real TTY (for s/f keys).
+- [ ] Robot ↔ GPU reachable (`:8765` direct, or SSH tunnel + `GPU_SERVER_HOST=127.0.0.1`).
 
 ---
 
-## 2-old. 历史进度（2026-07-03）
+## 4. Startup commands
 
-| 阶段 | 内容 | 状态 | 备注 |
-|------|------|------|------|
-| **Stage-2c** | 真实 VLA + 双路相机 infer | ⬜ **未通过** | 无图 infer → KeyError；或 GPU OOM |
-| **Stage-3** | replay warmup 500 步 | ⬜ 未开始 | |
-| **GPU 资源** | 独占 1×24GB | ❌ **阻塞** | 8 卡被 simvla 占满 |
+Paths contain `&` — **always quote** them (`&` is a shell operator).
 
----
-
-## 3. 已知运行现象（2026-07-10）
-
-- **首步 / 周期性 infer 1–2 分钟**：正常（pi05 + JAX）；工控机需耐心等待。
-- **Motion 卡顿**：每轮 infer 后只执行 10 步 @ 20Hz（~0.5s）再停；双机架构预期行为。
-- **GPU 终端 `keepalive ping timeout`**：infer 阻塞导致；buffer 仍涨则可持续。
-- **重启 server 会清空 replay buffer**（actor/critic 权重会从 ckpt 重载）。
-
----
-
-## 3-old. 历史阻塞（2026-07-03）
-
-### 3.1 GPU 显存不足（**首要**）
-
-- fvl08 **8×3090** 均被他人 `simvla` 占用（每卡约 15–23GB）
-- `start_gpu_rl_server.sh` 在 **RL token `.to(cuda)`** 阶段即 **CUDA OOM**
-- **8765 当前未监听** → 工控机无法连 server
-- **解决**：等实验结束，或协调 **让出 1 张整卡**（24GB 基本空闲），再：
-
-  ```bash
-  CUDA_VISIBLE_DEVICES=<空闲卡号> bash scripts/start_gpu_rl_server.sh
-  ```
-
-### 3.2 边界 NAT 未配置
-
-- 工控机 ping `10.176.53.120` ✅，但 `:8765` refused（无 DNAT）
-- **临时方案**：工控机 `scripts/gpu/start_ssh_tunnel.sh` + `GPU_SERVER_HOST=127.0.0.1` ✅ 已验证
-
-### 3.3 真实 VLA 必须带相机图
-
-- `--no-cameras` / `MOCK=1` 仅用于 **Mock VLA 通路测试**
-- GPU 已切 **真实 pi05** 后，infer **必须**有 `external` + `wrist` JPEG
-- 缺图报错：`KeyError: 'observation/exterior_image_1_left'`（不是加载失败）
-
----
-
-## 4. 启动流程（按顺序）
-
-### 前置条件
-
-- [ ] GPU 有 **≥1 张空闲 24GB 卡**
-- [ ] Stage-1 `rl_token.pt`、`pi05_base` checkpoint 在 GPU deploy 树 `checkpoints/`
-- [ ] 工控机 Deoxys 臂/夹爪 SOP 可用；RealSense serial 与 yaml 一致
-- [ ] 工控机已同步最新 `actor_loop.py`、`gpu_client.py`（见 §6）
-
----
-
-### Step 0 — 确认 GPU 有空闲（GPU 上）
-
-```bash
-nvidia-smi
-# 选一张 memory.free 接近 24GB 的卡，记下 index
-```
-
----
-
-### Step 1 — GPU server（GPU 终端 A，**一直挂着**）
+### 4.1 GPU server (GPU terminal, keep open)
 
 ```bash
 cd "/sdb/private_folders/shimingqi/smq_jgy_deploy/smq&jgy/rlt_project/rlt_reproduce"
-# 或工控机解压路径 ~/smq_jgy/smq\&jgy/rlt_project/rlt_reproduce
-
-export CUDA_VISIBLE_DEVICES=<空闲卡号>   # 2026-07-10 使用 1
-bash scripts/start_gpu_rl_server.sh
-# 默认 config: configs/plug_insertion_gpu.yaml（勿用工控机 plug_insertion.yaml）
+CUDA_VISIBLE_DEVICES=<free_gpu> bash scripts/start_gpu_rl_server.sh configs/plug_insertion_gpu.yaml
 ```
 
-**等到**（首次加载 pi05 可能 2–5 分钟，UserWarning 后可继续等；日志可能滞后）：
+Wait for (first pi05 load can take minutes):
 
 ```text
 Loaded RL token from checkpoints/rl_token.pt
@@ -140,156 +101,204 @@ Inference mode: reference
 RL server listening on ws://0.0.0.0:8765
 ```
 
-另开终端确认：
+Confirm: `ss -tlnp | grep 8765` → `LISTEN 0.0.0.0:8765`.
 
-```bash
-ss -tlnp | grep 8765
-# 应见 LISTEN 0.0.0.0:8765
-```
-
-> 终端挂着不动 = server 在等连接，**正常**。不要关此窗口。
-
----
-
-### Step 2 — SSH 隧道（工控机终端 B，无 NAT 时，**一直挂着**）
+### 4.2 SSH tunnel (robot terminal, if no NAT, keep open)
 
 ```bash
 cd "/home/host5010/workspaces/smq&jgy"
 bash scripts/gpu/start_ssh_tunnel.sh
+export GPU_SERVER_HOST=127.0.0.1
 ```
 
----
-
-### Step 3 — 工控机 Deoxys（按项目 SOP）
-
-起臂、夹爪等（`start_arm.sh` / `start_robot.sh`，以 smq&jgy 文档为准）。
-
----
-
-### Step 4 — 工控机 actor（工控机终端 C）
-
-**必须在 Step 1 出现 `RL server listening` 之后**再跑（不必同一秒，但 server 要先就绪）。
+### 4.3 Ping / health check (robot terminal)
 
 ```bash
 cd "/home/host5010/workspaces/smq&jgy"
-export GPU_SERVER_HOST=127.0.0.1    # 走隧道时
-
-# 真机 + 双路相机（真实 online RL 用这个）
-CONFIRM=1 bash scripts/run_deoxys_actor.sh --episodes 1 --max-steps 30
+bash scripts/ping_gpu_server.sh
 ```
 
-**不要**用于真实 VLA：
+Expected fields: `buffer_size`, `exec_state`, `inference_mode`, `warmup_steps=500`, `ramp_steps=500`, `train_steps`, `training`.
+- Forced reference run → `exec_state: override:reference`.
+
+### 4.4 Franka arm + gripper (robot terminal)
 
 ```bash
-MOCK=1 ... --no-cameras   # 仅 Mock/通路测试；真实 pi05 会 KeyError
+cd "/home/host5010/workspaces/smq&jgy"
+bash scripts/start_arm.sh
+bash scripts/start_gripper.sh
 ```
 
-运行中（终端需聚焦）：
+### 4.5 Robot actor loop (robot terminal, after server is `listening`)
 
-| 键 | 含义 |
-|----|------|
-| **s** | 成功，reward=1，结束 episode |
-| **f** | 失败，reward=0，结束 episode |
-| **q** | 退出 |
-
-期望 actor 首步 log：`GPU infer meta {'policy_mode': 'reference', ...}`
-
----
-
-## 5. Online RL 分阶段（reference vs policy）
-
-这是 **两件不同的事**：
-
-| 概念 | 配置 | 含义 |
-|------|------|------|
-| **执行模式** | `inference.mode` | `reference` = 跟 VLA 参考动作；`policy` = RL actor 输出动作 |
-| **何时开始训练** | `online_rl.warmup_steps: 500` | replay 满 **500 条 transition** 后 GPU 才开始 TD3 梯度更新 |
-
-### 推荐顺序
-
-| 阶段 | GPU `inference.mode` | 工控机 | 目的 |
-|------|----------------------|--------|------|
-| **A** | `reference`（当前默认） | 真机 + 相机，短 episode | 验 VLA 动作 + 双路图 |
-| **B** | `reference` | 多 episode，按 **s/f** 标 reward | 攒 replay → `buffer_size` → 500 |
-| **C** | 改 **`policy`**，**重启 server** | 同上 | actor 控臂 + 继续收 transition + 训练 |
-
-切 policy 时只改 **GPU** 上 `configs/plug_insertion_gpu.yaml`：
-
-```yaml
-inference:
-  mode: policy
-  deterministic: true
+```bash
+cd "/home/host5010/workspaces/smq&jgy"
+export GPU_SERVER_HOST=127.0.0.1     # if tunneling
+CONFIRM=1 bash scripts/run_deoxys_actor.sh --episodes 1 --max-steps 200
 ```
 
-工控机命令不变。
+- `run_deoxys_actor.sh` layers robot env then execs `run_actor_loop.sh` → `actor_loop.py` (Tree C), config `smq&jgy/configs/plug_insertion.yaml`.
+- Never use `MOCK=1` / `--no-cameras` for real VLA (→ `KeyError: observation/exterior_image_1_left`).
+- Keys (terminal focused): **s** = success (reward=1, done), **f** = fail (reward=0, done), **q** = quit run. Timeout at `max_steps_per_episode=200` = fail.
 
 ---
 
-## 6. 代码与路径
+## 5. Reference smoke test (do this first, every fresh run)
 
-### GPU deploy（fvl08 当前使用）
+Goal: confirm the reference pipeline + safety are healthy **before** collecting warmup data.
 
-```text
-/sdb/private_folders/shimingqi/smq_jgy_deploy/smq&jgy/rlt_project/rlt_reproduce/
-├── scripts/start_gpu_rl_server.sh    # 推荐入口
-├── scripts/run_rl_server.sh           # → rl_server.py
-├── configs/plug_insertion.yaml
-├── checkpoints/rl_token.pt            # 软链至 rlt_reproduce 训练产物
-├── checkpoints/pi05_base/
-└── src/rlt/scripts/rl_server.py       # JPEG WS + 真实 VLA + replay
+Run 1 short episode (§4.5, `--episodes 1 --max-steps 200`). **Check:**
+
+- [ ] Actor first-step log: `GPU infer meta {'policy_mode': 'reference', ...}` with sane `z_rl_norm`, `ref_norm`.
+- [ ] Arm moves smoothly toward the socket; magnitude looks like the SFT demo (not jerky/huge).
+- [ ] `s`/`f` ends the episode; auto reset runs before the next.
+- [ ] Reward JSON written: `logs/online_rl/rewards/ep_XXXX.json`.
+
+**Safety / abnormal-motion STOP conditions** (Phase 1 clamp in `deoxys_env.step`, applies to reference too):
+
+| Symptom | What it means | Action |
+|---------|---------------|--------|
+| `[safety] clamp` firing on almost every step with large raw norms | reference deltas exceed 0.02 m / 0.1 rad often | **STOP** (Ctrl-C). Check `action_is_physical: true`, VLA/action-space alignment |
+| `NaN`/`Inf` action logged, arm holds pose | bad model output | **STOP**, inspect VLA/RL-token load; do not continue |
+| Large-amplitude / unexpected motion, E-stop | pipeline mismatch | **STOP**, hit E-stop, do not switch to policy |
+| Per-step translation > 0.02 m or rotation > 0.1 rad reaching the arm | clamp bypassed | **STOP**, verify safety block present in `configs/plug_insertion.yaml` |
+
+Safety limits (robot config, `smq&jgy/configs/plug_insertion.yaml`): `max_trans_delta_m: 0.02`, `max_rot_delta_rad: 0.1`, gripper `[-1, 1]`.
+
+---
+
+## 6. Reference warmup (forced reference)
+
+Fill the replay buffer with **reference-only** trajectories. Execution is forced to reference regardless of buffer count.
+
+- GPU config `inference.mode: reference` (already set for the fresh run) → `act_gated` returns `alpha=0` always.
+- `online_rl.warmup_steps: 500`, `chunk_length: 10`, robot `online_rl.subsample_stride: 2`.
+- Each finished episode emits real chunk transitions at stride 2: `(x_s, a_{s:s+C}, ref_{s:s+C}, ref_{s+C:s+2C}, R, x_{s+C}, done)`. Terminal chunk padding: action/reference = last valid step, reward = 0.
+
+Run multiple episodes (§4.5, e.g. `--episodes 20 --max-steps 200`), pressing **s/f** honestly.
+
+**Do NOT proceed to auto until ALL of these hold:**
+
+1. [ ] `buffer_size >= 500` (via `ping`).
+2. [ ] Transition shapes/rewards/done verified — guaranteed by construction (robot `_validate_chunk_transition` and server strict `_as_action_chunk` both **raise** on malformed `(C=10,7)` / wrong gap; a running server with growing `buffer_size` and no shape errors = OK). Spot-check reward JSONs.
+3. [ ] **At least 2–3 successful reference episodes** (`reason: success_key`). Buffer≥500 that is almost all failures is **not** enough.
+
+Quick success/quality check (robot):
+
+```bash
+python3 - <<'PY'
+import glob, json, os
+base="/home/host5010/workspaces/smq&jgy"
+dirs=[base+"/rlt_project/rlt_reproduce/logs/online_rl/rewards", base+"/logs/online_rl/rewards"]
+fs=sum((sorted(glob.glob(d+"/*.json")) for d in dirs if os.path.isdir(d)),[])
+succ=sum(json.load(open(f))["reason"]=="success_key" for f in fs)
+print(f"episodes={len(fs)} successes={succ} -> {'PASS' if succ>=2 else 'NOT YET'}")
+PY
 ```
 
-### 工控机需同步的文件（GPU 更新后）
+---
 
-- `src/rlt/scripts/actor_loop.py`（transition 带 `state` + `next_proprio`+JPEG）
-- `src/rlt/rl/gpu_client.py`
-- `configs/plug_insertion.yaml`（工控机侧 host/tunnel 相关项）
+## 7. Actor/critic checkpoint verification (before switching modes)
 
-### 相关文档
+During forced reference, once `buffer_size >= warmup_steps` the learner trains and checkpoints. Before switching to auto, confirm:
 
-| 文档 | 位置 |
-|------|------|
-| 工控机任务清单 | `smq&jgy/ONLINE_RL_TASKS.md` |
-| 工控机 rollout 要点 | `docs/ONLINE_RL_ROBOT.md` |
-| GPU 部署包 | `smq_jgy_rl_server_20260702.tar.gz` |
+```bash
+cd "/sdb/private_folders/shimingqi/smq_jgy_deploy/smq&jgy/rlt_project/rlt_reproduce"
+ls -la checkpoints/rl_actor.pt checkpoints/rl_critic.pt
+ls -1 checkpoints/online_rl/ | tail
+```
+
+- [ ] `rl_actor.pt` / `rl_critic.pt` exist with a **recent** mtime.
+- [ ] `online_rl/` snapshots exist with increasing `stepNNNN_bufNNN` (via `ping`: `train_steps` > 0, `training: true`).
+- [ ] Load sanity (optional): weights finite, shapes match config (`actor_hidden`, `critic_hidden`, `action_dim=7`).
+
+If actor/critic are missing/stale, keep collecting reference data — do not switch.
 
 ---
 
-## 7. 常见报错对照
+## 8. Switch reference → auto (enable policy ramp)
 
-| 现象 | 原因 | 处理 |
-|------|------|------|
-| `CUDA error: out of memory`（启动时） | GPU 被占满 | 换空闲卡或等别人实验结束 |
-| `KeyError: observation/exterior_image_1_left` | infer **无相机图** | 去掉 `--no-cameras`，开 RealSense |
-| `connection handler failed` 紧跟 UserWarning | server **已起来**，infer 失败 | 看栈底 KeyError/OOM，不是「没加载完」 |
-| 工控机 `:8765` refused | server 未 listen 或 NAT 未配 | 查 `ss -tlnp`；无 NAT 用隧道 |
-| `policy_mode=reference` | 正常 | 尚未切 policy；不是 bug |
-| `stdin 非 TTY` | 无键盘 reward | 仅 timeout 结束 episode；实机用交互终端 |
+The gate is **buffer transition count**, so a clean 0→1 ramp requires the buffer to start from 0. Since restarting `rl_server` resets the in-memory buffer, the switch is naturally clean.
 
----
+**Procedure:**
 
-## 8. 下一步行动清单
+1. Edit GPU config `rlt_project/rlt_reproduce/configs/plug_insertion_gpu.yaml`: `inference.mode: reference` → `auto`. (Keep the Tree C mirror in parity.)
+2. **Restart** `rl_server` (§4.1). Restart **resets replay buffer to 0**; trained `rl_actor.pt`/`rl_critic.pt` are reloaded from disk.
+3. Auto gating (`act_gated`), with `warmup_steps=500`, `ramp_steps=500`:
 
-**GPU 侧（你）**
+| `buffer_size` | Executed action | `alpha` |
+|---------------|-----------------|---------|
+| `0 – 499` | VLA reference | 0 |
+| `500 – 999` | linear blend reference→anchored policy | `(buffer−500)/500` |
+| `≥ 1000` | anchored policy `ref + clip(actor−ref, ±δ)` | 1 |
 
-1. [ ] 协调 **1 张空闲 3090**
-2. [ ] `CUDA_VISIBLE_DEVICES=<N> bash scripts/start_gpu_rl_server.sh`，确认 `RL server listening`
-3. [ ] 保持 server 终端不关
+Anchor limits (GPU config `policy_anchor`): `max_dev_trans_m: 0.01`, `max_dev_rot_rad: 0.05`, `max_dev_grip: 1.0`.
 
-**工控机侧**
-
-1. [ ] `start_ssh_tunnel.sh` 常开
-2. [ ] 同步最新 actor/gpu_client（若尚未同步）
-3. [ ] `CONFIRM=1 run_deoxys_actor.sh`（**无** MOCK / **无** `--no-cameras`）
-4. [ ] reference 模式下多跑 episode，**s/f** 标 reward，直到 GPU `buffer_size ≥ 500`
-5. [ ] GPU 改 `mode: policy` 并重启 server → 继续 rollout
-
-**网络（可选，需管理员 sudo）**
-
-- [ ] 边界 NAT：`10.176.53.120:8765` → `192.168.110.18:8765`（`setup_port_forward_8765.sh` on fvl05）
+> Restart implication: auto re-warms 500 reference transitions (safe) before any policy blending. This re-collection is intentional, not waste. If you build buffer persistence later, set `warmup_steps` to the loaded buffer count so the ramp still starts at `alpha=0`.
 
 ---
 
-## 9. 一句话状态（2026-07-03）
+## 9. Monitoring during ramp / online RL
 
-**离线 RL Token 已完成；双机 JPEG WebSocket 在隧道 + MOCK 下已通；真实 pi05 + 真机 online RL 卡在 GPU 无空闲显存（OOM），且真机跑时必须开双路相机、不能用 `--no-cameras`。**
+**Watch (GPU `rl_server` log + `ping`):**
+
+- `buffer_size`, `exec_state` (`warmup_reference` → `ramp(alpha=…)` → `policy`), `alpha`.
+- `train_steps` increasing, `training: true`.
+- Learner metrics: `critic_loss`, `actor_loss`, `bc_loss` (BC regularization). Should stay bounded.
+- Per-step action stats: `ref_norm`, `actor_norm`, `deviation = ‖actor − ref‖`, clipped-deviation amount.
+
+**Watch (robot log):**
+
+- `[safety] clamp` frequency and raw vs clipped norms.
+- Motion smoothness, reward keypresses, reset success.
+
+**STOP conditions (Ctrl-C / E-stop, revert to `mode: reference`, investigate):**
+
+- Any `NaN`/`Inf` action, or safety clamp firing hard every step as `alpha` rises.
+- Actor deviation **constantly saturating** the anchor clip (0.01 m / 0.05 rad) → actor pulling away from reference; lower ramp rate or collect more warmup.
+- `critic_loss` / `actor_loss` diverging (orders-of-magnitude growth).
+- Success rate drops **below reference** as `alpha` increases, or motion becomes unsafe.
+- `buffer_size` not growing (dropped transitions / WS timeouts) — fix connectivity before trusting training.
+
+---
+
+## 10. Checkpoint / restart / recovery
+
+**Keep (never delete):** `checkpoints/rl_token.pt` (→ sft5000 real token), `checkpoints/pi05_base`, `checkpoints/pi05_plug_insertion`.
+
+**Online-RL, resettable:** `checkpoints/rl_actor.pt`, `checkpoints/rl_critic.pt`, `checkpoints/online_rl/`, in-memory replay buffer.
+
+**Fresh reset (Phase 5) — back up first, quote `&` paths:**
+
+```bash
+cd "/sdb/private_folders/shimingqi/smq_jgy_deploy/smq&jgy/rlt_project/rlt_reproduce"
+mkdir -p "backups/reset_$(date +%Y%m%d_%H%M%S)"
+cp -a "checkpoints/rl_actor.pt" "checkpoints/rl_critic.pt" "checkpoints/online_rl" "backups/reset_$(date +%Y%m%d_%H%M%S)/" 2>/dev/null || true
+rm -f "checkpoints/rl_actor.pt" "checkpoints/rl_critic.pt"
+rm -rf "checkpoints/online_rl"
+```
+
+- On next start, `rl_server` finds no `rl_actor.pt`/`rl_critic.pt` → **random init from scratch** (paper-faithful); `rl_token.pt` + SFT VLA load normally; buffer starts empty.
+- Set GPU config `inference.mode: reference` for the fresh run (see §6).
+
+**Recovery / continue (no reset):** just restart `rl_server` — actor/critic reload from `rl_actor.pt`/`rl_critic.pt`; buffer re-warms from 0 (reference) before any policy.
+
+---
+
+## 11. End-to-end checklist
+
+**Fresh run, first time:**
+
+- [ ] GPU: free card chosen (`nvidia-smi`); `rl_token.pt` + SFT VLA present.
+- [ ] (If resetting) backup + delete `rl_actor.pt`/`rl_critic.pt`/`online_rl/`; GPU config `inference.mode: reference`.
+- [ ] GPU: `start_gpu_rl_server.sh` → `RL server listening`; `ss -tlnp | grep 8765`.
+- [ ] Robot: tunnel up (if needed) + `GPU_SERVER_HOST=127.0.0.1`; `ping` OK, `exec_state: override:reference`.
+- [ ] Robot: arm + gripper started.
+- [ ] **§5 smoke test** (1 episode) passes; no NaN / no hard clamp / no abnormal motion.
+- [ ] **§6 warmup**: `buffer_size ≥ 500` **AND** ≥ 2–3 `success_key` episodes; shapes/rewards/done verified.
+- [ ] **§7**: `rl_actor.pt`/`rl_critic.pt` recent; `train_steps > 0`.
+- [ ] **§8 switch**: config `mode: auto`; **restart** `rl_server` (buffer→0).
+- [ ] **§9 monitor** ramp `alpha 0→1` over buffer 500→1000; stop on any listed condition.
+- [ ] Policy (`alpha=1`, buffer ≥ 1000): success ≥ reference and stable → continue; else revert to `reference` and investigate.
+
+**Do NOT:** retrain SFT/RL-token here; make the actor a residual policy; run policy before warmup+QA; skip `activate_rlt.sh` on the GPU; run real VLA with `--no-cameras`.

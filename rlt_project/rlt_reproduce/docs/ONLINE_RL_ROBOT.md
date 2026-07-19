@@ -1,5 +1,9 @@
 # Online RL — robot host checklist
 
+> **⚠️ SUPERSEDED (2026-07-19).** The authoritative RLT online-RL runbook is now
+> [`ONLINE_RL_RUNBOOK.md`](ONLINE_RL_RUNBOOK.md). Follow that file for the full
+> workflow; this doc is kept for history.
+
 > **最后更新**：2026-07-10  
 > Dual-machine stack: **JPEG WebSocket** (`actor_loop.py` ↔ `rl_server.py`).
 
